@@ -1,6 +1,6 @@
 # RINGER
 
-This repository is the official implementation of [RINGER: Rapid Conformer Generation for Macrocycles with Sequence-Conditioned Internal Coordinate Diffusion](https://arxiv.org).
+This repository is the official implementation of [RINGER: Rapid Conformer Generation for Macrocycles with Sequence-Conditioned Internal Coordinate Diffusion](https://arxiv.org/abs/2305.19800).
 
 ![cover](assets/overview.png)
 
@@ -80,7 +80,14 @@ Licensed under the MIT License. See [LICENSE](LICENSE) for additional details.
 For the code and/or model, please cite:
 
 ```
-@article{#TODO}
+@misc{grambow2023ringer,
+    title={{RINGER}: Rapid Conformer Generation for Macrocycles with Sequence-Conditioned Internal Coordinate Diffusion}, 
+    author={Colin A. Grambow and Hayley Weir and Nathaniel L. Diamant and Alex M. Tseng and Tommaso Biancalani and Gabriele Scalia and Kangway V. Chuang},
+    year={2023},
+    eprint={2305.19800},
+    archivePrefix={arXiv},
+    primaryClass={q-bio.BM}
+}
 ```
 
 To cite the CREMP dataset, please use:
@@ -96,7 +103,7 @@ To cite the CREMP dataset, please use:
 }
 ```
 
-You can also cite the Zenodo repository directly:
+You can also cite the CREMP Zenodo repository directly:
 
 ```
 @dataset{grambow_colin_a_2023_7931445,
