@@ -16,7 +16,7 @@ pip install -e .
 
 ## Data
 
-Download and extract the CREMP pickle.tar.gz from [here](https://doi.org/10.5281/zenodo.7931445). Use [train.csv](data/cremp/train.csv) and [test.csv](data/cremp/test.csv) to partition it into training and test data and put the corresponding files into [train](data/cremp/train) and [test](data/cremp/test).
+Download and extract the CREMP pickle.tar.gz from [here](https://doi.org/10.5281/zenodo.8010582). Use [train.csv](data/cremp/train.csv) and [test.csv](data/cremp/test.csv) to partition it into training and test data and put the corresponding files into [train](data/cremp/train) and [test](data/cremp/test).
 
 ## Training
 
