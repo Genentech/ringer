@@ -1,7 +1,7 @@
 {
     "data_dir": "tetrapeptides",
     "split_sizes": [0.8, 0.1, 0.1],
-    "internal_coordinates_definitions": "angles",
+    "internal_coordinates_definitions": "angles-sidechains",
     "use_atom_features": true,
     "atom_feature_fingerprint_radius": 3,
     "atom_feature_fingerprint_size": 32,
@@ -19,6 +19,7 @@
     "dropout_p": 0.1,
     "decoder": "mlp",
     "loss": "smooth_l1",
+    "use_feat_mask": false,
     "l2_norm": 0.0,
     "l1_norm": 0.0,
     "circle_reg": 0.0,
