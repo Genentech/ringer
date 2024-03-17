@@ -12,6 +12,44 @@ AMINO_ACID_DATA["residue_mol"] = AMINO_ACID_DATA["residue_smiles"].map(Chem.MolF
 
 RING_PEPTIDE_BOND_PATTERN = Chem.MolFromSmarts("[C;R:0](=[OX1:1])[C;R:2][N;R:3]")
 
+GENERIC_AMINO_ACID_SMARTS = "[$([CX3](=[OX1]))][NX3,NX4+][$([CX4H]([CX3](=[OX1])[O,N]))][*]"
+
+# These don't match all atoms in the side chains, but only the ones we're interested in
+# extracting internal coordinates for
+SIDE_CHAIN_TORSIONS_SMARTS_DICT = {
+    "alanine": "[CH3X4]",
+    "asparagine": "[CH2X4][$([CX3](=[OX1])[NX3H2])][NX3H2]",
+    "aspartic acid": "[CH2X4][$([CX3](=[OX1])[OH0-,OH])][OH0-,OH]",
+    "cysteine": "[CH2X4][SX2H,SX1H0-]",
+    "glutamic acid": "[CH2X4][CH2X4][$([CX3](=[OX1])[OH0-,OH])][OH0-,OH]",
+    "glutamine": "[CH2X4][CH2X4][$([CX3](=[OX1])[NX3H2])][NX3H2]",
+    "histidine": "[CH2X4][$([#6X3]1:[$([#7X3H+,#7X2H0+0]:[#6X3H]:[#7X3H]),$([#7X3H])]:[#6X3H]:[$([#7X3H+,#7X2H0+0]:[#6X3H]:[#7X3H]),$([#7X3H])]:[#6X3H]1)]:[#6X3H]",
+    "isoleucine": "[$([CHX4]([CH3X4])[CH2X4][CH3X4])][CH2X4][CH3X4]",
+    "leucine": "[CH2X4][$([CHX4]([CH3X4])[CH3X4])][CH3X4]",
+    "lysine": "[CH2X4][CH2X4][CH2X4][CH2X4][NX4+,NX3+0]",
+    "phenylalanine": "[CH2X4][$([cX3]1[cX3H][cX3H][cX3H][cX3H][cX3H]1)][cX3H]",
+    "serine": "[CH2X4][OX2H]",
+    "threonine": "[$([CHX4]([OX2H])[CH3X4])][CH3X4]",
+    "tryptophan": "[CH2X4][$([cX3]1[cX3H][nX3H][cX3]2[cX3H][cX3H][cX3H][cX3H][cX3]12)][cX3H0]",
+    "tyrosine": "[CH2X4][$([cX3]1[cX3H][cX3H][cX3]([OHX2,OH0X1-])[cX3H][cX3H]1)][cX3H]",
+    "valine": "[$([CHX4]([CH3X4])[CH3X4])][CH3X4]",
+}
+AMINO_ACID_TORSIONS_SMARTS_DICT = {
+    name: GENERIC_AMINO_ACID_SMARTS.replace("[*]", smarts)
+    for name, smarts in SIDE_CHAIN_TORSIONS_SMARTS_DICT.items()
+}
+# Handle proline separately because it doesn't fit the generic amino acid template.
+# Make sure we only match three backbone atoms and the beta carbon because we only want
+# to model the torsion coming out of the ring
+AMINO_ACID_TORSIONS_SMARTS_DICT[
+    "proline"
+] = "[$([CX3](=[OX1]))][$([$([NX3H,NX4H2+]),$([NX3](C)(C)(C))]1[CX4H]([CH2][CH2][CH2]1)[CX3](=[OX1])[OX2H,OX1-,N])][$([CX4H]1[CH2][CH2][CH2][$([NX3H,NX4H2+]),$([NX3](C)(C)(C))]1)][$([CX4H2]1[CH2][CH2][$([NX3H,NX4H2+]),$([NX3](C)(C)(C))][CX4H]1)]"
+AMINO_ACID_TORSIONS_PATTERNS = {
+    name: Chem.MolFromSmarts(smarts) for name, smarts in AMINO_ACID_TORSIONS_SMARTS_DICT.items()
+}
+# These will be matched twice, we only want to keep one match
+AMINO_ACIDS_WITH_SYMMETRY = {"leucine", "phenylalanine", "tyrosine", "valine"}
+
 
 def get_amino_acid_stereo(symbol: str) -> Optional[str]:
     # None for glycine
@@ -91,3 +129,32 @@ def get_residues(
             residue_dict[atom_idxs] = residue
 
     return residue_dict
+
+
+def get_side_chain_torsion_idxs(mol: Chem.Mol) -> Dict[int, List[int]]:
+    """Get the indices of atoms in the side chains that we want to calculate internal coordinates
+    for.
+
+    Args:
+        mol: Molecule.
+
+    Returns:
+        Mapping from alpha-carbon atom index to its side-chain indices.
+    """
+    side_chain_torsion_idxs = {}
+
+    for amino_acid_name, pattern in AMINO_ACID_TORSIONS_PATTERNS.items():
+        matches = mol.GetSubstructMatches(pattern)
+        if matches:
+            if amino_acid_name in AMINO_ACIDS_WITH_SYMMETRY:
+                # Take every 2nd match
+                assert len(matches) % 2 == 0
+                matches = matches[::2]
+
+            for match in matches:
+                # Alpha carbon is 3rd matched atom
+                alpha_carbon = match[2]
+                assert alpha_carbon not in side_chain_torsion_idxs
+                side_chain_torsion_idxs[alpha_carbon] = list(match)
+
+    return side_chain_torsion_idxs

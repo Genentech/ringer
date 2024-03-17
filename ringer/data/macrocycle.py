@@ -44,6 +44,7 @@ class MacrocycleInternalCoordinateDataset(Dataset):
         split_sizes: Sequence[float] = (0.8, 0.1, 0.1),
         num_conf: Union[int, str] = 30,
         all_confs_in_test: bool = True,
+        weights: Optional[Dict[str, float]] = None,
         zero_center: bool = True,  # Center the features to have 0 mean
         use_cache: bool = True,  # Use/build cached computations of dihedrals and angles
         cache_dir: Union[str, Path] = Path(os.path.dirname(os.path.abspath(__file__))),
@@ -62,6 +63,7 @@ class MacrocycleInternalCoordinateDataset(Dataset):
             split_sizes: Fractions of the data to use for train, validation, and test splits.
             num_conf: Maximum number of conformers to load for each molecule (can be "all").
             all_confs_in_test: Override num_conf if split is test to load all conformers for each molecule.
+            weights: For features with weights other than 1, specify their weights as a mapping from feature name to their weight.
             seed: Random seed needed to reproduce data splitting so that loading from the same files in the same directory produces identical splits.
             sample_seed: Random seed used for sampling sequence lengths.
         """
@@ -108,6 +110,11 @@ class MacrocycleInternalCoordinateDataset(Dataset):
 
         self.split = split
 
+        if weights is not None:
+            for name in weights:
+                assert name in self.feature_names
+        self.weights = weights
+
         self.use_atom_features = use_atom_features
         self.fingerprint_radius = fingerprint_radius
         self.fingerprint_size = fingerprint_size
@@ -148,7 +155,7 @@ class MacrocycleInternalCoordinateDataset(Dataset):
         # We have not yet populated self.structures
         if self.structures is None:
             self.__clean_mismatched_caches()
-            self.structures = self.__compute_featurization(self.fnames, num_proc=num_proc)
+            self.structures = self._compute_featurization(self.fnames, num_proc=num_proc)
             if use_cache and not codebase_matches_hash:
                 logging.info(f"Saving full dataset to cache at {self.cache_fname}")
                 self.__save_cache(codebase_hash)
@@ -182,25 +189,14 @@ class MacrocycleInternalCoordinateDataset(Dataset):
         self._means: Optional[Dict[str, float]] = None
         if zero_center:
             # Note that there is no padding yet
-            all_distances = np.concatenate(
-                [s["distance"].to_numpy().ravel() for s in self.structures.values()]
-            )
-            all_angles = np.concatenate(
-                [s["angle"].to_numpy().ravel() for s in self.structures.values()]
-            )
-            all_dihedrals = np.concatenate(
-                [s["dihedral"].to_numpy().ravel() for s in self.structures.values()]
-            )
-
-            distance_mean = np.mean(all_distances)
-            angle_mean = np.mean(all_angles)
-            dihedral_mean = utils.wrapped_mean(all_dihedrals)
-
-            self._means = {
-                "distance": distance_mean,
-                "angle": angle_mean,
-                "dihedral": dihedral_mean,
-            }
+            self._means = {}
+            for feature_name, is_angular in zip(self.feature_names, self.feature_is_angular):
+                all_features = np.concatenate(
+                    [s[feature_name].to_numpy().ravel() for s in self.structures.values()]
+                )
+                mean_func = utils.wrapped_mean if is_angular else np.nanmean
+                feature_mean = mean_func(all_features)
+                self._means[feature_name] = feature_mean
 
             # Subtract the mean and perform modulo where values are radial (note that we
             # actually defer this operation until self.__getitem__)
@@ -391,7 +387,7 @@ class MacrocycleInternalCoordinateDataset(Dataset):
             loaded_hash, loaded_atom_features = pickle.load(source)
         return loaded_hash, loaded_atom_features
 
-    def __compute_featurization(
+    def _compute_featurization(
         self, fnames: Sequence[str], num_proc: int = 1
     ) -> Dict[str, Dict[str, pd.DataFrame]]:
         pfunc = internal_coords.get_macrocycle_distances_and_angles_from_file
@@ -516,9 +512,9 @@ class MacrocycleInternalCoordinateDataset(Dataset):
 
     @means.setter
     def means(self, means: Dict[str, float]) -> None:
-        if any(k not in means for k in ["distance", "angle", "dihedral"]):
+        if any(k not in self.feature_names for k in means.keys()):
             raise ValueError(
-                f"Expected dictionary of 'distance', 'angle', and 'dihedral' means, received: '{means}'"
+                f"Expected dictionary of '{self.feature_names}' means, received: '{means}'"
             )
         self._means = means
 
@@ -582,12 +578,19 @@ class MacrocycleInternalCoordinateDataset(Dataset):
         ), f"Illegal value: {np.max(internal_coords[:, self.feature_is_angular])}"
         angles = torch.from_numpy(internal_coords).float()
 
+        weights = torch.ones(len(self.feature_names)).float()
+        if self.weights is not None:
+            feat_to_idx = dict(zip(self.feature_names, range(len(self.feature_names))))
+            for feat_name, weight in self.weights.items():
+                weights[feat_to_idx[feat_name]] = weight
+
         retval = {
             "angles": angles,
             "attn_mask": attn_mask,
             "position_ids": position_ids,
             "atom_ids": atom_ids,
             "lengths": torch.tensor(seq_length, dtype=torch.int64),
+            "weights": weights,
         }
 
         if self.use_atom_features:
@@ -607,3 +610,169 @@ class MacrocycleAnglesDataset(MacrocycleInternalCoordinateDataset):
 class MacrocycleDihedralsDataset(MacrocycleInternalCoordinateDataset):
     feature_names = ("dihedral",)
     feature_is_angular = (True,)
+
+
+class MacrocycleAnglesWithSideChainsDataset(MacrocycleInternalCoordinateDataset):
+    side_chain_feature_names = {
+        "angle": ("sc_a0", "sc_a1", "sc_a2", "sc_a3", "sc_a4"),
+        "dihedral": ("sc_chi0", "sc_chi1", "sc_chi2", "sc_chi3", "sc_chi4"),
+    }
+    feature_names = (
+        ("angle", "dihedral")
+        + side_chain_feature_names["angle"]
+        + side_chain_feature_names["dihedral"]
+    )
+    feature_is_angular = (True,) * len(feature_names)
+    feature_is_sidechain = (False, False) + (True,) * (
+        len(side_chain_feature_names["angle"]) + len(side_chain_feature_names["dihedral"])
+    )
+
+    @classmethod
+    def _flatten_side_chain_features(
+        cls, internal_coord_dict: Dict[str, pd.DataFrame]
+    ) -> Dict[str, pd.DataFrame]:
+        # Atom indices and number of confs should be the same for each coordinate
+        atom_idxs = list(internal_coord_dict[cls.feature_names[0]].columns)
+        total_confs = len(internal_coord_dict[cls.feature_names[0]])
+
+        # Modify in place
+        for feature_type, feature_names in cls.side_chain_feature_names.items():
+            for position, feature_name in enumerate(feature_names):
+                side_chain_data = {}
+
+                for atom_idx in atom_idxs:
+                    if atom_idx in internal_coord_dict["side_chains"]:
+                        side_chain_ic_df = internal_coord_dict["side_chains"][atom_idx][
+                            feature_type
+                        ]
+
+                        try:
+                            side_chain_ics = side_chain_ic_df.iloc[:, position]
+                        except IndexError:
+                            side_chain_ics = pd.Series(np.nan, index=range(total_confs))
+                    else:
+                        side_chain_ics = pd.Series(np.nan, index=range(total_confs))
+
+                    side_chain_data[atom_idx] = side_chain_ics
+
+                side_chain_df = pd.DataFrame(side_chain_data)
+                side_chain_df.index.name = "conf_idx"
+                internal_coord_dict[feature_name] = side_chain_df
+
+        return internal_coord_dict
+
+    def _compute_featurization(
+        self, fnames: Sequence[str], num_proc: int = 1
+    ) -> Dict[str, Dict[str, pd.DataFrame]]:
+        pfunc = functools.partial(
+            internal_coords.get_macrocycle_distances_and_angles_from_file, include_side_chains=True
+        )
+
+        logging.info(f"Computing full dataset of {len(fnames)} with {num_proc} processes")
+        if num_proc == 1:
+            internal_coord_dicts = list(map(pfunc, fnames))
+        else:
+            with multiprocessing.Pool(processes=num_proc) as pool:
+                internal_coord_dicts = list(pool.map(pfunc, fnames))
+
+        structures = {}
+        for fname, ic_dict in zip(fnames, internal_coord_dicts):
+            ic_dict = self._flatten_side_chain_features(ic_dict)
+
+            if isinstance(self.num_conf, int):
+                for k, v in ic_dict.items():
+                    if (
+                        k in MacrocycleInternalCoordinateDataset.feature_names
+                        or k in self.feature_names
+                    ):
+                        ic_dict[k] = v.iloc[: self.num_conf]
+
+            structures[fname] = ic_dict
+
+        return structures
+
+    # TODO: use __getitem__ from parent instead, just copying now for quick prototyping
+    def __getitem__(self, index: int, ignore_zero_center: bool = False) -> Dict[str, torch.Tensor]:
+        if not 0 <= index < len(self):
+            raise IndexError("Index out of range")
+
+        fname, conf_idx = self.global_conf_ids[index]
+        structure = self.structures[fname]
+
+        internal_coords_allconfs = [structure[name] for name in self.feature_names]
+        macrocycle_idxs = internal_coords_allconfs[0].columns
+        assert all((df.columns == macrocycle_idxs).all() for df in internal_coords_allconfs)
+        macrocycle_idxs = list(macrocycle_idxs)
+
+        internal_coords = np.vstack(
+            [df.loc[conf_idx].to_numpy() for df in internal_coords_allconfs]
+        ).T
+
+        means = self.means
+        if means is not None and not ignore_zero_center:
+            internal_coords = internal_coords - means
+            internal_coords[:, self.feature_is_angular] = utils.modulo_with_wrapped_range(
+                internal_coords[:, self.feature_is_angular], -np.pi, np.pi
+            )
+
+        # Create mask to mask out unused side-chain features. 0 indicates masked
+        seq_length = min(self.pad, len(internal_coords))
+        feat_mask = torch.zeros(size=(self.pad, len(self.feature_names)))
+        feat_mask[:seq_length] = ~torch.from_numpy(np.isnan(internal_coords))
+
+        # Replace nan values with zero
+        np.nan_to_num(internal_coords, copy=False, nan=0)
+
+        # Create attention mask. 0 indicates masked
+        attn_mask = torch.zeros(size=(self.pad,))
+        attn_mask[:seq_length] = 1.0
+
+        # Perform padding
+        if len(internal_coords) < self.pad:
+            internal_coords = np.pad(
+                internal_coords,
+                ((0, self.pad - len(internal_coords)), (0, 0)),
+                mode="constant",
+                constant_values=0.0,
+            )
+
+        # Create position IDs
+        position_ids = torch.arange(start=0, end=self.pad, step=1, dtype=torch.long)
+
+        # Create backbone atom IDs
+        atom_ids = torch.zeros(self.pad, dtype=torch.long)
+        atom_ids[: len(structure["atom_ids"])] = torch.tensor(
+            structure["atom_ids"], dtype=torch.long
+        )
+
+        assert utils.tolerant_comparison_check(
+            internal_coords[:, self.feature_is_angular], ">=", -np.pi
+        ), f"Illegal value: {np.min(internal_coords[:, self.feature_is_angular])}"
+        assert utils.tolerant_comparison_check(
+            internal_coords[:, self.feature_is_angular], "<=", np.pi
+        ), f"Illegal value: {np.max(internal_coords[:, self.feature_is_angular])}"
+        angles = torch.from_numpy(internal_coords).float()
+
+        weights = torch.ones(len(self.feature_names)).float()
+        if self.weights is not None:
+            feat_to_idx = dict(zip(self.feature_names, range(len(self.feature_names))))
+            for feat_name, weight in self.weights.items():
+                weights[feat_to_idx[feat_name]] = weight
+
+        retval = {
+            "angles": angles,
+            "attn_mask": attn_mask,
+            "feat_mask": feat_mask,
+            "position_ids": position_ids,
+            "atom_ids": atom_ids,
+            "lengths": torch.tensor(seq_length, dtype=torch.int64),
+            "weights": weights,
+        }
+
+        if self.use_atom_features:
+            atom_features = self.get_atom_features(
+                fname, pad=True, atom_idxs=macrocycle_idxs, return_idxs=False
+            )
+            retval["atom_features"] = atom_features
+
+        return retval

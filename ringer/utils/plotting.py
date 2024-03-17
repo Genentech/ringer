@@ -19,6 +19,7 @@ def plot_ramachandran(
     x: str = "phi",
     y: str = "psi",
     col: Optional[str] = None,
+    col_wrap: Optional[int] = None,
     col_order: Optional[List[str]] = None,
     row: Optional[str] = None,
     row_order: Optional[List[str]] = None,
@@ -31,6 +32,7 @@ def plot_ramachandran(
     g = sns.FacetGrid(
         data,
         col=col,
+        col_wrap=col_wrap,
         col_order=col_order,
         row=row,
         row_order=row_order,
@@ -70,6 +72,7 @@ def plot_distributions(
     data: pd.DataFrame,
     x: str,
     col: Optional[str] = None,
+    col_wrap: Optional[int] = None,
     row: Optional[str] = None,
     hue: Optional[str] = None,
     binwidth: float = 2 * np.pi / 100,
@@ -78,6 +81,7 @@ def plot_distributions(
     height: int = 3,
     format_as_dihedral_axis: bool = True,
     xlabel: Optional[str] = None,
+    latex: bool = True,
     path: Optional[Union[str, Path]] = None,
     add_kl_div: bool = True,
     **kwargs,
@@ -86,6 +90,7 @@ def plot_distributions(
         data,
         hue=hue,
         col=col,
+        col_wrap=col_wrap,
         row=row,
         sharex=sharex,
         sharey=sharey,
@@ -103,9 +108,15 @@ def plot_distributions(
     if xlabel is None:
         for label, ax in g.axes_dict.items():
             if row is None:
-                ax.set_xlabel(rf"$\{label}$")  # LaTeX
+                if latex:
+                    ax.set_xlabel(rf"$\{label}$")
+                else:
+                    ax.set_xlabel(label)
             else:
-                ax.set_xlabel(rf"$\{label[1]}$")
+                if latex:
+                    ax.set_xlabel(rf"$\{label[1]}$")
+                else:
+                    ax.set_xlabel(label[1])
     else:
         g.set_xlabels(label=xlabel)
     g.set_ylabels(label="Density")
@@ -291,6 +302,51 @@ def plot_angle_and_dihedral_distributions(
             despine=False,
             path=get_path("dihedrals_dists"),
         )
+
+
+def plot_side_chain_distributions(
+    data: pd.DataFrame,
+    plot_dir: Optional[Union[str, Path]] = None,
+    ext: str = ".png",
+) -> None:
+    def get_path(name: str) -> Optional[Path]:
+        if plot_dir is None:
+            return None
+        fname = f"{name}{ext}"
+        return Path(plot_dir) / fname
+
+    plot_distributions(
+        data=data[data["feature"].str.startswith("sc_a")],
+        x="value",
+        col="feature",
+        col_wrap=5,
+        hue="src",
+        height=2,
+        aspect=1,
+        binwidth=np.pi / 200,
+        format_as_dihedral_axis=False,
+        xlabel="value",
+        latex=False,
+        xlim=(1.5, 2.5),
+        legend_out=False,
+        despine=False,
+        path=get_path("sidechain_angle_dists"),
+    )
+    plot_distributions(
+        data=data[data["feature"].str.startswith("sc_chi")],
+        x="value",
+        col="feature",
+        col_wrap=5,
+        hue="src",
+        height=2,
+        aspect=1,
+        binwidth=2 * np.pi / 60,
+        format_as_dihedral_axis=True,
+        latex=False,
+        legend_out=False,
+        despine=False,
+        path=get_path("sidechain_dihedral_dists"),
+    )
 
 
 def format_facet_grid_dihedral_axis(g: sns.FacetGrid, which: Literal["x", "y"] = "x") -> None:

@@ -2,7 +2,7 @@ import functools
 import hashlib
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Union
+from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -10,13 +10,24 @@ from scipy import stats
 from typer.models import ParameterInfo
 
 
-def get_overlapping_sublists(list_: List[Any], size: int):
+def get_wrapped_overlapping_sublists(list_: List[Any], size: int) -> Iterator[List[Any]]:
     for idx in range(len(list_)):
         idxs = [idx]
         for offset in range(1, size):
             # Wrap past end of list
             idxs.append((idx + offset) % len(list_))
         yield [list_[i] for i in idxs]
+
+
+def get_overlapping_sublists(
+    list_: List[Any], size: int, wrap: bool = True
+) -> Iterator[List[Any]]:
+    if wrap:
+        for item in get_wrapped_overlapping_sublists(list_, size):
+            yield item
+    else:
+        for i in range(len(list_) - size + 1):
+            yield list_[i : i + size]
 
 
 def compute_kl_divergence(p: np.ndarray, q: np.ndarray, nbins: int = 100) -> float:

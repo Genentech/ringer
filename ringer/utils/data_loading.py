@@ -1,7 +1,7 @@
 import logging
 import multiprocessing
 from pathlib import Path
-from typing import Dict, Literal, Optional, Sequence, Union
+from typing import Dict, List, Literal, Optional, Sequence, Union
 
 import numpy as np
 
@@ -11,7 +11,9 @@ from .. import data
 from ..data import noised
 from . import variance_schedules
 
-INTERNAL_COORDINATES_DEFINITIONS = Literal["distances-angles", "angles", "dihedrals"]
+INTERNAL_COORDINATES_DEFINITIONS = Literal[
+    "distances-angles", "angles", "dihedrals", "angles-sidechains"
+]
 
 
 def get_datasets(
@@ -24,8 +26,11 @@ def get_datasets(
     atom_feature_fingerprint_size: int = 32,
     max_conf: Union[int, str] = 30,
     timesteps: int = 50,
+    weights: Optional[Dict[str, float]] = None,
     variance_schedule: variance_schedules.SCHEDULES = "cosine",
     variance_scale: float = np.pi,
+    mask_noise: bool = False,
+    mask_noise_for_features: Optional[List[str]] = None,
     exhaustive_t: bool = False,
     use_cache: bool = True,
     cache_dir: Optional[Union[str, Path]] = None,
@@ -56,6 +61,7 @@ def get_datasets(
         split_sizes=split_sizes,
         num_conf=max_conf,
         all_confs_in_test=True,
+        weights=weights,
         zero_center=True,
         use_cache=use_cache,
         unsafe_cache=unsafe_cache,
@@ -83,6 +89,8 @@ def get_datasets(
             beta_schedule=variance_schedule,
             nonangular_variance=1.0,
             angular_variance=variance_scale,
+            mask_noise=mask_noise,
+            mask_noise_for_features=mask_noise_for_features,
         )
         for split, dset in clean_dsets.items()
     }

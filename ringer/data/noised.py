@@ -28,6 +28,8 @@ class NoisedDataset(Dataset):
         beta_schedule: variance_schedules.SCHEDULES = "cosine",
         nonangular_variance: float = 1.0,
         angular_variance: float = 1.0,
+        mask_noise: bool = False,
+        mask_noise_for_features: Optional[List[str]] = None,
     ) -> None:
         super().__init__()
 
@@ -48,6 +50,12 @@ class NoisedDataset(Dataset):
 
         betas = variance_schedules.get_variance_schedule(beta_schedule, timesteps)
         self.alpha_beta_terms = variance_schedules.compute_alphas(betas)
+
+        # Whether to use feature mask to mask out (side-chain) noise
+        self.mask_noise = mask_noise
+
+        # List of feature names that we don't want to noise
+        self.mask_noise_for_features = mask_noise_for_features
 
     @property
     def structures(self) -> Optional[Dict[str, Dict[str, pd.DataFrame]]]:
@@ -108,13 +116,16 @@ class NoisedDataset(Dataset):
         else:
             return int(len(self.dset) * self.timesteps)
 
-    def sample_noise(self, vals: torch.Tensor) -> torch.Tensor:
+    def sample_noise(self, vals: torch.Tensor, uniform: bool = False) -> torch.Tensor:
         """Adaptively sample noise based on modulo.
 
         We scale only the variance because we want the noise to remain zero centered
         """
         # Noise is always 0 centered
-        noise = torch.randn_like(vals)
+        if uniform:
+            noise = torch.rand_like(vals) * 2 * np.pi - np.pi
+        else:
+            noise = torch.randn_like(vals)
 
         # Shapes of vals couled be (batch, seq, feat) or (seq, feat)
         # Therefore we need to index into last dimension consistently
@@ -186,6 +197,14 @@ class NoisedDataset(Dataset):
         # Noise is sampled within range of [-pi, pi], and optionally
         # shifted to [0, 2pi] by adding pi
         noise = self.sample_noise(vals)  # Vals passed in only for shape
+
+        if self.mask_noise and "feat_mask" in item:
+            noise[~item["feat_mask"].bool()] = 0
+
+        if self.mask_noise_for_features is not None:
+            feature_names = np.array(self.feature_names)
+            feat_mask_idxs = np.in1d(feature_names, self.mask_noise_for_features).nonzero()[0]
+            noise[..., feat_mask_idxs] = 0
 
         # Add noise and ensure noised vals are still in range
         noised_vals = sqrt_alphas_cumprod_t * vals + sqrt_one_minus_alphas_cumprod_t * noise

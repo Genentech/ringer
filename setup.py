@@ -7,7 +7,7 @@ with open("README.md") as source:
 
 setup(
     name="ringer",
-    version="1.0.0",
+    version="1.1.0",
     description="Rapid conformer generation for macrocycles with internal coordinate diffusion",
     author="Colin Grambow, Hayley Weir, Kangway Chuang",
     author_email="grambow.colin@gene.com",

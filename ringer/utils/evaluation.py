@@ -1,4 +1,6 @@
+import multiprocessing
 from collections import defaultdict
+from functools import partial
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -30,21 +32,52 @@ def compute_cov_mat_metrics(
     return {"cov": cov, "mat": mat}
 
 
-def compute_ring_rmsd_matrix(
-    probe_mol: Chem.Mol,
-    ref_mol: Chem.Mol,
-    conf_ids_probe: Optional[List[int]] = None,
-    conf_ids_ref: Optional[List[int]] = None,
-) -> np.ndarray:
-    probe_mol = Chem.RemoveHs(probe_mol)
-    ref_mol = Chem.RemoveHs(ref_mol)
-
-    # Precompute atom map for faster RMSD calculation
+def get_atom_map(probe_mol: Chem.Mol, ref_mol: Chem.Mol) -> List[Dict[int, int]]:
     ref_mol_idxs = [a.GetIdx() for a in ref_mol.GetAtoms()]
     matches = probe_mol.GetSubstructMatches(
         ref_mol, uniquify=False
     )  # Don't uniquify to account for symmetry
     atom_map = [dict(zip(match, ref_mol_idxs)) for match in matches]
+    return atom_map
+
+
+def compute_rmsd_matrix(
+    probe_mol: Chem.Mol,
+    ref_mol: Chem.Mol,
+    conf_ids_probe: Optional[List[int]] = None,
+    conf_ids_ref: Optional[List[int]] = None,
+    ncpu: int = 1,
+) -> np.ndarray:
+    probe_mol = Chem.RemoveHs(probe_mol)
+    ref_mol = Chem.RemoveHs(ref_mol)
+
+    # Precompute atom map for faster RMSD calculation
+    atom_map = get_atom_map(probe_mol, ref_mol)
+    atom_map = [list(map_.items()) for map_ in atom_map]
+
+    rmsd_mat = compute_rmsd_matrix_from_map(
+        probe_mol,
+        ref_mol,
+        atom_map,
+        conf_ids_probe=conf_ids_probe,
+        conf_ids_ref=conf_ids_ref,
+        ncpu=ncpu,
+    )
+    return rmsd_mat  # [num_ref x num_probe]
+
+
+def compute_ring_rmsd_matrix(
+    probe_mol: Chem.Mol,
+    ref_mol: Chem.Mol,
+    conf_ids_probe: Optional[List[int]] = None,
+    conf_ids_ref: Optional[List[int]] = None,
+    ncpu: int = 1,
+) -> np.ndarray:
+    probe_mol = Chem.RemoveHs(probe_mol)
+    ref_mol = Chem.RemoveHs(ref_mol)
+
+    # Precompute atom map for faster RMSD calculation
+    atom_map = get_atom_map(probe_mol, ref_mol)
 
     # Subset to macrocycle indices
     probe_macrocycle_idxs = chem.get_macrocycle_idxs(probe_mol, n_to_c=False)
@@ -66,7 +99,12 @@ def compute_ring_rmsd_matrix(
             raise ValueError("Inconsistent macrocycle indices")
 
     rmsd_mat = compute_rmsd_matrix_from_map(
-        probe_mol, ref_mol, atom_map, conf_ids_probe=conf_ids_probe, conf_ids_ref=conf_ids_ref
+        probe_mol,
+        ref_mol,
+        atom_map,
+        conf_ids_probe=conf_ids_probe,
+        conf_ids_ref=conf_ids_ref,
+        ncpu=ncpu,
     )
     return rmsd_mat  # [num_ref x num_probe]
 
@@ -77,6 +115,7 @@ def compute_rmsd_matrix_from_map(
     atom_map: List[Sequence[Tuple[int, int]]],
     conf_ids_probe: Optional[List[int]] = None,
     conf_ids_ref: Optional[List[int]] = None,
+    ncpu: int = 1,
 ) -> np.ndarray:
     if conf_ids_ref is None:
         conf_ids_ref = [conf.GetId() for conf in ref_mol.GetConformers()]
@@ -86,18 +125,34 @@ def compute_rmsd_matrix_from_map(
     num_ref = len(conf_ids_ref)
     num_probe = len(conf_ids_probe)
 
-    rmsd_mat = np.empty((num_ref, num_probe))
+    _get_best_rms_args = []
     for i, ref_id in enumerate(conf_ids_ref):
         for j, probe_id in enumerate(conf_ids_probe):
-            rmsd = AllChem.GetBestRMS(
-                probe_mol, ref_mol, prbId=probe_id, refId=ref_id, map=atom_map
-            )
-            rmsd_mat[i, j] = rmsd
+            _get_best_rms_args.append((i, j, probe_id, ref_id))
+
+    pfunc = partial(_get_best_rms, probe_mol=probe_mol, ref_mol=ref_mol, atom_map=atom_map)
+    with multiprocessing.Pool(ncpu) as pool:
+        rmsds_with_idxs = pool.map(pfunc, _get_best_rms_args)
+
+    rmsd_mat = np.empty((num_ref, num_probe))
+    for i, j, rmsd in rmsds_with_idxs:
+        rmsd_mat[i, j] = rmsd
 
     return rmsd_mat  # [num_ref x num_probe]
 
 
-def compute_ring_tfd_matrix(probe_mol: Chem.Mol, ref_mol: Chem.Mol) -> np.ndarray:
+def _get_best_rms(
+    args: Tuple[int, int, int, int],
+    probe_mol: Chem.Mol,
+    ref_mol: Chem.Mol,
+    atom_map: List[Sequence[Tuple[int, int]]],
+) -> Tuple[int, int, float]:
+    i, j, probe_id, ref_id = args
+    rmsd = AllChem.GetBestRMS(probe_mol, ref_mol, prbId=probe_id, refId=ref_id, map=atom_map)
+    return i, j, rmsd
+
+
+def compute_ring_tfd_matrix(probe_mol: Chem.Mol, ref_mol: Chem.Mol, ncpu: int = 1) -> np.ndarray:
     """Compute ring torsion fingerprint deviation as in
     https://doi.org/10.1021/acs.jcim.0c00025."""
     probe_mol = Chem.RemoveHs(probe_mol)
@@ -133,37 +188,59 @@ def compute_ring_tfd_matrix(probe_mol: Chem.Mol, ref_mol: Chem.Mol) -> np.ndarra
         )
     ref_macrocycle_idxs_check = set(ref_macrocycle_idxs_check)
 
-    # There could be multiple maps, so select the minimum TFD for each one
-    tfds = []
+    ref_macrocycle_idxs_list = []
     for map_ in atom_map:
         ref_macrocycle_idxs = [ref_idx for _, ref_idx in map_]  # Same order as in probe
         if set(ref_macrocycle_idxs) != ref_macrocycle_idxs_check:
             raise ValueError("Inconsistent macrocycle indices")
+        ref_macrocycle_idxs_list.append(ref_macrocycle_idxs)
 
-        ref_torsions = internal_coords.get_macrocycle_dihedrals(ref_mol, ref_macrocycle_idxs)
-        ref_torsions = ref_torsions.to_numpy()
-
-        # Compute deviations between all pairs of conformers
-        ref_torsions_tiled = np.tile(ref_torsions[:, np.newaxis, :], (1, num_conf_probe, 1))
-        torsion_deviation = probe_torsions_tiled - ref_torsions_tiled
-
-        # Wrap deviation around [-pi, pi] range
-        torsion_deviation = (torsion_deviation + np.pi) % (2 * np.pi) - np.pi
-
-        # Scale by max deviation, sum across torsions, and normalize
-        tfd = np.sum(np.abs(torsion_deviation) / np.pi, axis=-1) / num_torsions
-        tfds.append(tfd)
-
+    # There could be multiple maps, so select the minimum TFD for each one
+    pfunc = partial(
+        _get_ring_tfd_for_ref_idxs,
+        ref_mol=ref_mol,
+        num_conf_probe=num_conf_probe,
+        probe_torsions_tiled=probe_torsions_tiled,
+        num_torsions=num_torsions,
+    )
+    with multiprocessing.Pool(ncpu) as pool:
+        tfds = pool.map(pfunc, ref_macrocycle_idxs_list)
     tfd = np.minimum.reduce(tfds)
+
     return tfd  # [num_ref x num_probe]
+
+
+def _get_ring_tfd_for_ref_idxs(
+    ref_macrocycle_idxs: List[int],
+    ref_mol: Chem.Mol,
+    num_conf_probe: int,
+    probe_torsions_tiled: np.ndarray,
+    num_torsions: int,
+) -> np.ndarray:
+    ref_torsions = internal_coords.get_macrocycle_dihedrals(ref_mol, ref_macrocycle_idxs)
+    ref_torsions = ref_torsions.to_numpy()
+
+    # Compute deviations between all pairs of conformers
+    ref_torsions_tiled = np.tile(ref_torsions[:, np.newaxis, :], (1, num_conf_probe, 1))
+    torsion_deviation = probe_torsions_tiled - ref_torsions_tiled
+
+    # Wrap deviation around [-pi, pi] range
+    torsion_deviation = (torsion_deviation + np.pi) % (2 * np.pi) - np.pi
+
+    # Scale by max deviation, sum across torsions, and normalize
+    tfd = np.sum(np.abs(torsion_deviation) / np.pi, axis=-1) / num_torsions
+
+    return tfd
 
 
 class CovMatEvaluator:
     confusion_mat_funcs = {
+        "rmsd": compute_rmsd_matrix,  # heavy atoms
         "ring-rmsd": compute_ring_rmsd_matrix,
         "ring-tfd": compute_ring_tfd_matrix,
     }
     thresholds = {
+        "rmsd": np.arange(0, 2.51, 0.01),
         "ring-rmsd": np.arange(0, 1.26, 0.01),
         "ring-tfd": np.arange(0, 1.01, 0.01),  # Can't be larger than 1
     }
@@ -175,12 +252,12 @@ class CovMatEvaluator:
         self.metric_names = metrics
 
     def __call__(
-        self, probe_mol: Chem.Mol, ref_mol: Chem.Mol
+        self, probe_mol: Chem.Mol, ref_mol: Chem.Mol, ncpu: int = 1
     ) -> Dict[str, Dict[str, Union[Dict[str, float], Dict[str, np.ndarray]]]]:
         metrics = {}
         for metric_name in self.metric_names:
             confusion_mat_func = self.confusion_mat_funcs[metric_name]
-            confusion_mat = confusion_mat_func(probe_mol, ref_mol)
+            confusion_mat = confusion_mat_func(probe_mol, ref_mol, ncpu=ncpu)
             metric = compute_cov_mat_metrics(
                 confusion_mat, thresholds=self.thresholds[metric_name]
             )

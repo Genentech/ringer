@@ -3,6 +3,7 @@ from typing import List, Optional, Set, Union
 import numpy as np
 import pandas as pd
 from rdkit import Chem
+from rdkit.Chem import AllChem
 
 from . import utils
 
@@ -66,6 +67,23 @@ def extract_macrocycle(mol: Chem.Mol) -> Chem.Mol:
         rwmol.RemoveAtom(idx)
 
     new_mol = rwmol.GetMol()
+    return new_mol
+
+
+def combine_mols(mols: List[Chem.Mol]) -> Chem.Mol:
+    """Combine multiple molecules with one conformer each into one molecule with multiple
+    conformers.
+
+    Args:
+        mols: List of molecules.
+
+    Returns:
+        Combined molecule.
+    """
+    new_mol = Chem.Mol(mols[0], quickCopy=True)
+    for mol in mols:
+        conf = Chem.Conformer(mol.GetConformer())
+        new_mol.AddConformer(conf, assignId=True)
     return new_mol
 
 
@@ -165,7 +183,7 @@ def _dfs(
         for atom_nei in atom.GetNeighbors():
             atom_nei_idx = atom_nei.GetIdx()
             if atom_nei_idx not in visited:
-                if blocked_idxs is not None and atom_nei_idx not in blocked_idxs:
+                if blocked_idxs is None or atom_nei_idx not in blocked_idxs:
                     _dfs(
                         atom_nei,
                         depth=depth + 1,

@@ -16,7 +16,6 @@ dependencies:
   - conda-forge::seaborn
   - conda-forge::astropy
   - conda-forge::rdkit>=2022.09.5
-  - conda-forge::geometric
   - conda-forge::pre-commit
   - conda-forge::pytest
   - conda-forge::rich

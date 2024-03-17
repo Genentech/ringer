@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 
-import argparse
 import json
 import logging
 import multiprocessing
@@ -117,7 +116,11 @@ def train(
     timesteps: int = 50,
     variance_schedule: variance_schedules.SCHEDULES = "cosine",
     variance_scale: float = 1.0,
+    use_feat_mask: bool = True,
+    mask_noise: bool = False,
+    mask_noise_for_features: Optional[List[str]] = None,
     # Model architecture
+    restart_dir: Optional[Union[str, Path]] = None,  # Restart from checkpoint
     time_encoding: bert_for_diffusion.TIME_ENCODING = "gaussian_fourier",
     num_hidden_layers: int = 3,
     hidden_size: int = 24,
@@ -138,6 +141,7 @@ def train(
     min_epochs: Optional[int] = None,
     max_epochs: int = 2000,
     warmup_epochs: int = 100,
+    weights: Optional[Dict[str, float]] = None,
     early_stop_patience: int = 0,  # Set to 0 to disable early stopping
     use_swa: bool = False,  # Stochastic weight averaging can improve training genearlization
     # Miscellaneous
@@ -172,8 +176,11 @@ def train(
         atom_feature_fingerprint_size=atom_feature_fingerprint_size,
         max_conf=max_conf,
         timesteps=timesteps,
+        weights=weights,
         variance_schedule=variance_schedule,
         variance_scale=variance_scale,
+        mask_noise=mask_noise,
+        mask_noise_for_features=mask_noise_for_features,
         exhaustive_t=exhaustive_validation_t,
         use_cache=use_data_cache,
         cache_dir=data_cache_dir,
@@ -237,16 +244,10 @@ def train(
         attention_probs_dropout_prob=dropout_p,
         use_cache=False,
     )
-    model = bert_for_diffusion.BertForDiffusion(
-        config=config,
-        ft_is_angular=dsets["train"].feature_is_angular,
-        ft_names=dsets["train"].feature_names,
-        time_encoding=time_encoding,
-        decoder=decoder,
-        atom_feature_size=atom_feature_size,
-        atom_feature_embed_size=atom_feature_embed_size,
+    bert_kwargs = dict(
         lr=lr,
         loss=loss,
+        use_feat_mask=use_feat_mask,
         l2=l2_norm,
         l1=l1_norm,
         circle_reg=circle_reg,
@@ -255,7 +256,23 @@ def train(
         lr_scheduler=lr_scheduler,
         write_preds_to_dir=out_dir / "validation_preds" if write_validation_preds else None,
     )
-    config.save_pretrained(out_dir)
+    if restart_dir is None:
+        model = bert_for_diffusion.BertForDiffusion(
+            config=config,
+            ft_is_angular=dsets["train"].feature_is_angular,
+            ft_names=dsets["train"].feature_names,
+            time_encoding=time_encoding,
+            decoder=decoder,
+            atom_feature_size=atom_feature_size,
+            atom_feature_embed_size=atom_feature_embed_size,
+            **bert_kwargs,
+        )
+    else:
+        model = bert_for_diffusion.BertForDiffusion.from_dir(
+            dir_name=restart_dir,
+            **bert_kwargs,
+        )
+    model.config.save_pretrained(out_dir)
 
     callbacks = build_callbacks(
         out_dir=out_dir, early_stop_patience=early_stop_patience, swa=use_swa
@@ -308,6 +325,7 @@ def train(
 def train_from_config(
     config: str = typer.Argument(..., help="JSON file containing training parameters"),
     out_dir: str = typer.Option("results", help="Directory to write model training outputs to"),
+    restart_dir: str = typer.Option(None, help="Directory to restart from"),
     wandb_run: str = typer.Option(None, help="Run name for WandB logging"),
     ncpu: int = typer.Option(multiprocessing.cpu_count(), help="Number of workers"),
     ngpu: int = typer.Option(-1, help="Number of GPUs to use (-1 for all)"),
@@ -347,6 +365,7 @@ def train_from_config(
         config_args,
         {
             "out_dir": out_dir,
+            "restart_dir": restart_dir,
             "overwrite": overwrite,
             "ncpu": ncpu,
             "ngpu": ngpu,

@@ -119,11 +119,13 @@ def sample_batch(
     seq_lengths: Sequence[int],
     atom_ids: Optional[torch.Tensor] = None,
     atom_features: Optional[torch.Tensor] = None,
+    uniform: bool = False,
     final_timepoint_only: bool = True,
     disable_pbar: bool = False,
 ) -> List[np.ndarray]:
     noise = dset.sample_noise(
-        torch.zeros((len(seq_lengths), dset.pad, model.n_inputs), dtype=torch.float32)
+        torch.zeros((len(seq_lengths), dset.pad, model.n_inputs), dtype=torch.float32),
+        uniform=uniform,
     )
 
     samples = p_sample_loop(
@@ -163,6 +165,7 @@ def sample_unconditional_from_lengths(
     model: nn.Module,
     dset: noised.NoisedDataset,
     seq_lengths: Sequence[int],
+    uniform: bool = False,
     batch_size: int = 65536,
     final_timepoint_only: bool = True,
     disable_pbar: bool = False,
@@ -173,6 +176,7 @@ def sample_unconditional_from_lengths(
         model: Model.
         dset: Only needed for its means, sample_noise, timesteps, alpha_beta_terms, feature_is_angular, and pad attributes.
         seq_lengths: Generate one sample for each sequence length provided.
+        uniform: Sample uniformly instead of from a wrapped normal.
         batch_size: Batch size.
         final_timepoint_only: Only return the sample at the final (non-noisy) timepoint.
         disable_pbar: Don't display a progress bar.
@@ -200,6 +204,7 @@ def sample_unconditional_from_lengths(
             dset=dset,
             seq_lengths=seq_lengths_batch,
             atom_ids=atom_ids_batch,
+            uniform=uniform,
             final_timepoint_only=final_timepoint_only,
             disable_pbar=disable_pbar,
         )
@@ -220,6 +225,7 @@ def sample_unconditional(
     model: nn.Module,
     dset: noised.NoisedDataset,
     num_samples: int = 1,
+    uniform: bool = False,
     batch_size: int = 65536,
     final_timepoint_only: bool = True,
     disable_pbar: bool = False,
@@ -233,6 +239,7 @@ def sample_unconditional(
         model,
         dset,
         seq_lengths,
+        uniform=uniform,
         batch_size=batch_size,
         final_timepoint_only=final_timepoint_only,
         disable_pbar=disable_pbar,
@@ -244,6 +251,7 @@ def sample_conditional(
     dset: noised.NoisedDataset,
     samples_multiplier: int = 2,
     samples_per_mol: Optional[int] = None,
+    uniform: bool = False,
     batch_size: int = 65536,
     final_timepoint_only: bool = True,
     disable_pbar: bool = False,
@@ -257,6 +265,7 @@ def sample_conditional(
         dset: Dataset to generate samples for (must contain atom features).
         samples_multiplier: For each molecule in the dataset, generate sample_multiplier * num_conformers samples.
         samples_per_mol: Override samples_multiplier to generate exactly this many samples per molecule.
+        uniform: Sample uniformly instead of from a wrapped normal.
         batch_size: Batch size.
         final_timepoint_only: Only return the sample at the final (non-noisy) timepoint.
         disable_pbar: Don't display a progress bar.
@@ -299,6 +308,7 @@ def sample_conditional(
             dset=dset,
             seq_lengths=seq_lengths[idx_start:idx_end],
             atom_features=atom_features[idx_start:idx_end],
+            uniform=uniform,
             final_timepoint_only=final_timepoint_only,
             disable_pbar=disable_pbar,
         )
@@ -324,6 +334,9 @@ def sample_conditional(
             for feat_idx, feature_name in enumerate(dset.feature_names):
                 df = pd.DataFrame(data=samples_mol[..., feat_idx], columns=atom_idxs)
                 df.index.name = "sample_idx"
+                feat_missing = structure[feature_name].iloc[0].isna()
+                feat_missing_cols = feat_missing[feat_missing].index
+                df[feat_missing_cols] = np.nan
                 samples_mol_dict[feature_name] = df
             samples_dict[fname] = samples_mol_dict
         else:  # Return as arrays

@@ -6,6 +6,7 @@ import logging
 import multiprocessing
 import pickle
 import subprocess
+from collections import defaultdict
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -15,9 +16,16 @@ import torch
 import typer
 from rdkit import Chem
 
-from ringer.data import noised
+from ringer.data import macrocycle, noised
 from ringer.models import bert_for_diffusion
-from ringer.utils import data_loading, internal_coords, plotting, sampling, utils
+from ringer.utils import (
+    data_loading,
+    internal_coords,
+    peptides,
+    plotting,
+    sampling,
+    utils,
+)
 
 
 class Split(str, Enum):
@@ -49,6 +57,60 @@ def stack_structures(
         df["num_residues"] = f"{len(structure['atom_labels']) // 3} residues"
         dfs.append(df)
     return pd.concat(dfs)
+
+
+def get_side_chain_feat_names(mol: Chem.Mol) -> Dict[int, Tuple[str, ...]]:
+    side_chain_torsion_idxs = peptides.get_side_chain_torsion_idxs(mol)
+    side_chain_feat_names = {}
+    feat_names = macrocycle.MacrocycleAnglesWithSideChainsDataset.side_chain_feature_names
+
+    for backbone_atom_idx, chain_atom_idxs in side_chain_torsion_idxs.items():
+        angle_idxs = chain_atom_idxs[1:]
+        angle_idxs = list(utils.get_overlapping_sublists(angle_idxs, 3, wrap=False))
+        dihedral_idxs = chain_atom_idxs
+        dihedral_idxs = list(utils.get_overlapping_sublists(dihedral_idxs, 4, wrap=False))
+
+        side_chain_feat_names[backbone_atom_idx] = feat_names["angle"][: len(angle_idxs)]
+        side_chain_feat_names[backbone_atom_idx] += feat_names["dihedral"][: len(dihedral_idxs)]
+
+    # Mapping from backbone index to feature names for the side chain attached to it
+    return side_chain_feat_names
+
+
+def stack_structures_side_chains(
+    structures: Dict[str, Dict[str, Any]], num_conf: Optional[int] = None
+) -> pd.DataFrame:
+    data = defaultdict(list)
+
+    for path, structure in structures.items():
+        # Need to only extract feature names that actually exist
+        with open(path, "rb") as f:
+            mol = pickle.load(f)["rd_mol"]
+        feat_name_dict = get_side_chain_feat_names(mol)
+
+        for backbone_atom_idx, feat_names in feat_name_dict.items():
+            for feat_name in feat_names:
+                feats = structure[feat_name][backbone_atom_idx].iloc[:num_conf]
+                data[feat_name].extend(feats)
+
+    data = {k: data[k] for k in sorted(data)}
+    dfs = []
+    for k, v in data.items():
+        df = pd.DataFrame({"value": v})
+        df["feature"] = k
+        dfs.append(df)
+    df = pd.concat(dfs)
+
+    return df
+
+
+def label_and_combine_side_chain_data(dataframes: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    dfs = []
+    for dataset_label, dataframe in dataframes.items():
+        dataframe["src"] = dataset_label
+        dfs.append(dataframe)
+    combined_data = pd.concat(dfs)
+    return combined_data
 
 
 def label_and_combine_data(dataframes: Dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -167,6 +229,7 @@ def reconstruct_mols(
     mean_angles_path: Optional[Union[str, Path]] = None,
     std_angles_path: Optional[Union[str, Path]] = None,
     skip_opt: bool = False,
+    max_conf: Optional[int] = None,
     num_proc: int = multiprocessing.cpu_count(),
 ) -> subprocess.CompletedProcess:
     reconstruct_script_path = Path(__file__).resolve().parent / "reconstruct.py"
@@ -193,6 +256,8 @@ def reconstruct_mols(
         )
     if skip_opt:
         cmd.append("--skip-opt")
+    if max_conf is not None:
+        cmd.extend(["--max-conf", str(max_conf)])
     completed_process = subprocess.run(cmd)
     if completed_process.returncode != 0:
         logging.warning(
@@ -252,6 +317,7 @@ def conditional(
     do_reconstruct: bool = True,
     do_metrics: bool = True,
     skip_opt: bool = False,
+    max_opt_conf: Optional[int] = None,
     num_conf: Optional[int] = None,
     ext: str = ".png",
     num_proc: int = multiprocessing.cpu_count(),
@@ -268,6 +334,7 @@ def conditional(
         std_angles_path: Path to file containing bond angle stdevs from training data.
         do_reconstruct: Whether to reconstruct mols, reconstructed mols must already be present in out_dir if False.
         do_metrics: Whether to compute metrics, metrics must already be present in out_dir if False.
+        max_opt_conf: Reconstruct at most this many conformers.
         num_conf: Number of conformers to use from reference data.
         ext: File extension for plots.
         num_proc: Number of parallel workers.
@@ -321,6 +388,7 @@ def conditional(
             mean_angles_path=mean_angles_path,
             std_angles_path=std_angles_path,
             skip_opt=skip_opt,
+            max_conf=max_opt_conf,
             num_proc=num_proc,
         )
     elif any(not (mol_opt_dir / Path(fname).name).exists() for fname in mols.keys()):
@@ -333,6 +401,170 @@ def conditional(
     # Make plots with reconstructed data
     logging.info("Plotting")
     reconstructed_data = stack_structures(samples_reconstructed, dset.feature_names)
+    dataframes["Reconstructed"] = reconstructed_data
+    combined_data_with_reconstructed = label_and_combine_data(dataframes)
+    phi_psi_data_with_reconstructed = get_phi_psi_data(combined_data_with_reconstructed)
+    num_test = len(
+        phi_psi_data_with_reconstructed[phi_psi_data_with_reconstructed["src"] == "Test"]
+    )
+    num_sampled = len(
+        phi_psi_data_with_reconstructed[phi_psi_data_with_reconstructed["src"] == "Sampled"]
+    )
+    # Make num_sampled <= num_test
+    phi_psi_data_with_reconstructed_1x = phi_psi_data_with_reconstructed.groupby("src").sample(
+        n=min(num_test, num_sampled)
+    )
+    plotting.plot_ramachandran_plots(
+        phi_psi_data_with_reconstructed,
+        plot_dir,
+        name="ramachandran_with_reconstructed",
+        col_order=["Test", "Sampled", "Reconstructed"],
+    )
+    plotting.plot_ramachandran_plots(
+        phi_psi_data_with_reconstructed,
+        plot_dir,
+        name="ramachandran_with_reconstructed",
+        col_order=["Test", "Sampled", "Reconstructed"],
+        residues=True,
+    )
+    plotting.plot_ramachandran_plots(
+        phi_psi_data_with_reconstructed_1x,
+        plot_dir,
+        name="ramachandran_with_reconstructed_1x",
+        col_order=["Test", "Sampled", "Reconstructed"],
+    )
+    plotting.plot_ramachandran_plots(
+        phi_psi_data_with_reconstructed_1x,
+        plot_dir,
+        name="ramachandran_with_reconstructed_1x",
+        col_order=["Test", "Sampled", "Reconstructed"],
+        residues=True,
+    )
+
+    # Compute metrics
+    if do_metrics:
+        logging.info(f"Computing metrics with {num_proc} processes")
+        compute_metrics(
+            out_dir=out_dir, mol_dir=mol_dir, mol_opt_dir=mol_opt_dir, num_proc=num_proc
+        )
+
+    metrics_path = out_dir / "metrics.pickle"
+    with open(metrics_path, "rb") as f:
+        metrics = pickle.load(f)
+
+    metrics_agg_path = out_dir / "metrics_aggregated.pickle"
+    with open(metrics_agg_path, "rb") as f:
+        metrics_agg = pickle.load(f)
+
+    coverage = get_coverage_dataframe(metrics)
+    coverage_path = plot_dir / f"coverage{ext}"
+    plotting.plot_coverage(coverage, path=coverage_path)
+
+    return dataframes, metrics_agg
+
+
+def conditional_side_chains(
+    samples: Dict[str, Dict[str, pd.DataFrame]],
+    dset: noised.NoisedDataset,
+    out_dir: Union[str, Path],
+    mean_distances_path: Union[str, Path],
+    mean_angles_path: Optional[Union[str, Path]] = None,
+    std_angles_path: Optional[Union[str, Path]] = None,
+    do_reconstruct: bool = True,
+    do_metrics: bool = True,
+    skip_opt: bool = False,
+    max_opt_conf: Optional[int] = None,
+    num_conf: Optional[int] = None,
+    ext: str = ".png",
+    num_proc: int = multiprocessing.cpu_count(),
+) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Dict[str, pd.DataFrame]]]:
+    """Perform evaluation of conditional model with side chains, i.e., plot distributions and
+    Ramachandran plots, perform optimization to recover consistent macrocycle angles, and compute
+    metrics.
+
+    Args:
+        samples: Samples from conditional model.
+        dset: Dataset containing reference data.
+        out_dir: Directory to write output/plots to.
+        mean_distances_path: Path to file containing mean distances from training data.
+        mean_angles_path: Path to file containing mean bond angles from training data.
+        std_angles_path: Path to file containing bond angle stdevs from training data.
+        do_reconstruct: Whether to reconstruct mols, reconstructed mols must already be present in out_dir if False.
+        do_metrics: Whether to compute metrics, metrics must already be present in out_dir if False.
+        max_opt_conf: Reconstruct at most this many conformers.
+        num_conf: Number of conformers to use from reference data.
+        ext: File extension for plots.
+        num_proc: Number of parallel workers.
+
+    Returns:
+        Stacked samples, reference data, and reconstructed data.
+    """
+    out_dir = Path(out_dir)
+
+    # Stack data
+    logging.info("Formatting test data")
+    test_data = stack_structures(dset.structures, ["angle", "dihedral"], num_conf=num_conf)
+    sampled_data = stack_structures(samples, ["angle", "dihedral"])
+
+    dataframes = {"Sampled": sampled_data, "Test": test_data}
+    combined_data = label_and_combine_data(dataframes)
+
+    test_data_sc = stack_structures_side_chains(dset.structures, num_conf=num_conf)
+    sampled_data_sc = stack_structures_side_chains(samples, num_conf=num_conf)
+
+    dataframes_sc = {"Sampled": sampled_data_sc, "Test": test_data_sc}
+    combined_data_sc = label_and_combine_side_chain_data(dataframes_sc)
+
+    logging.info("Plotting")
+    plot_dir = out_dir / "plots"
+    plot_dir.mkdir(exist_ok=True)
+    plotting.plot_angle_and_dihedral_distributions(combined_data, plot_dir, ext=ext)
+    plotting.plot_angle_and_dihedral_distributions(combined_data, plot_dir, ext=ext, residues=True)
+    plotting.plot_side_chain_distributions(combined_data_sc, plot_dir=plot_dir, ext=ext)
+
+    phi_psi_data = get_phi_psi_data(combined_data)
+    num_test = len(phi_psi_data[phi_psi_data["src"] == "Test"])
+    num_sampled = len(phi_psi_data[phi_psi_data["src"] == "Sampled"])
+    # Make num_sampled <= num_test
+    phi_psi_data_1x = phi_psi_data.groupby("src").sample(n=min(num_test, num_sampled))
+    plotting.plot_ramachandran_plots(phi_psi_data, plot_dir, as_rows=True)
+    plotting.plot_ramachandran_plots(phi_psi_data, plot_dir, residues=True)
+    plotting.plot_ramachandran_plots(
+        phi_psi_data_1x, plot_dir, as_rows=True, name="ramachandran_1x"
+    )
+    plotting.plot_ramachandran_plots(
+        phi_psi_data_1x, plot_dir, name="ramachandran_1x", residues=True
+    )
+
+    # Reconstruct/optimize mols
+    mol_dir = out_dir / "mols"
+    mol_opt_dir = out_dir / "reconstructed_mols"
+    mols = {fname: dset.atom_features[fname]["mol"] for fname in samples.keys()}
+    save_mols(mol_dir, mols)
+
+    # Reconstruct in separate Python call to avoid multiprocessing overhead
+    if do_reconstruct:
+        logging.info(f"Reconstructing rings with {num_proc} processes")
+        reconstruct_mols(
+            out_dir=out_dir,
+            mol_dir=mol_dir,
+            mean_distances_path=mean_distances_path,
+            mean_angles_path=mean_angles_path,
+            std_angles_path=std_angles_path,
+            skip_opt=skip_opt,
+            max_conf=max_opt_conf,
+            num_proc=num_proc,
+        )
+    elif any(not (mol_opt_dir / Path(fname).name).exists() for fname in mols.keys()):
+        raise ValueError(f"Missing reconstructed mols in '{mol_opt_dir}'")
+
+    samples_reconstructed_path = out_dir / "samples_reconstructed.pickle"
+    with open(samples_reconstructed_path, "rb") as source:
+        samples_reconstructed = pickle.load(source)
+
+    # Make plots with reconstructed data
+    logging.info("Plotting")
+    reconstructed_data = stack_structures(samples_reconstructed, ["angle", "dihedral"])
     dataframes["Reconstructed"] = reconstructed_data
     combined_data_with_reconstructed = label_and_combine_data(dataframes)
     phi_psi_data_with_reconstructed = get_phi_psi_data(combined_data_with_reconstructed)
@@ -445,6 +677,11 @@ def evaluate(
         help="Number of conformers to use from test set for plotting and evaluation",
         rich_help_panel="Sampling",
     ),
+    uniform: bool = typer.Option(
+        False,
+        help="Sample uniformly instead of from wrapped normal",
+        rich_help_panel="Sampling",
+    ),
     batch_size: int = typer.Option(
         65536, help="Batch size for sampling", rich_help_panel="Sampling"
     ),
@@ -460,6 +697,11 @@ def evaluate(
     skip_opt: bool = typer.Option(
         False,
         help="Skip optimization during reconstruction and just set Cartesian coordinates by going through the sequence linearly",
+        rich_help_panel="Other",
+    ),
+    max_opt_conf: Optional[int] = typer.Option(
+        None,
+        help="Maximum number of conformers to reconstruct",
         rich_help_panel="Other",
     ),
     eval_only: bool = typer.Option(
@@ -585,13 +827,16 @@ def evaluate(
             logging.info("Disabling reconstruction and computing metrics")
             do_reconstruct = do_metrics = False
         eval_func = functools.partial(
-            conditional,
+            conditional_side_chains
+            if isinstance(dset.dset, macrocycle.MacrocycleAnglesWithSideChainsDataset)
+            else conditional,
             mean_distances_path=train_mean_distances_path,
             mean_angles_path=train_mean_angles_path,
             std_angles_path=train_std_angles_path,
             do_reconstruct=do_reconstruct,
             do_metrics=do_metrics,
             skip_opt=skip_opt,
+            max_opt_conf=max_opt_conf,
             num_proc=ncpu,
         )
     else:  # Unconditional generation
@@ -619,7 +864,7 @@ def evaluate(
         )
 
         torch.manual_seed(seed)  # Set for reproducibility
-        samples = sample_func(model=model, dset=dset, batch_size=batch_size)
+        samples = sample_func(model=model, dset=dset, batch_size=batch_size, uniform=uniform)
         with open(samples_path, "wb") as sink:
             pickle.dump(samples, sink)
 

@@ -4,11 +4,10 @@ import pickle
 from collections import defaultdict
 from functools import partial
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
-from geometric.internal import Angle, Dihedral, Distance
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from scipy.optimize import (
@@ -18,7 +17,7 @@ from scipy.optimize import (
     minimize,
 )
 
-from . import chem, utils
+from . import chem, peptides, utils
 
 BACKBONE_ATOM_LABELS = ["N", "Calpha", "CO"]
 BACKBONE_ATOM_IDS = [0, 1, 2]
@@ -26,11 +25,13 @@ BACKBONE_ATOM_ID_TO_LABEL = dict(zip(BACKBONE_ATOM_IDS, BACKBONE_ATOM_LABELS))
 
 
 def get_macrocycle_distances_and_angles_from_file(
-    fname: Union[str, Path]
-) -> Dict[str, Union[List[str], List[int], pd.DataFrame]]:
+    fname: Union[str, Path],
+    include_side_chains: bool = False,
+    mol_key: Optional[str] = "rd_mol",
+) -> Dict[str, Union[List[str], List[int], pd.DataFrame, Dict]]:
     with open(fname, "rb") as f:
         ensemble_data = pickle.load(f)
-    mol = ensemble_data["rd_mol"]
+    mol = ensemble_data if mol_key is None else ensemble_data[mol_key]
 
     # Get macrocycle indices in N to C direction starting at an N
     macrocycle_idxs = chem.get_macrocycle_idxs(mol, n_to_c=True)
@@ -45,13 +46,42 @@ def get_macrocycle_distances_and_angles_from_file(
     angles = get_macrocycle_bond_angles(mol, macrocycle_idxs)
     dihedrals = get_macrocycle_dihedrals(mol, macrocycle_idxs)
 
-    return {
+    result = {
         "atom_labels": atom_labels,
         "atom_ids": atom_ids,
         "distance": distances,
         "angle": angles,
         "dihedral": dihedrals,
     }
+
+    if include_side_chains:
+        result["side_chains"] = get_side_chain_distances_and_angles(mol)
+
+    return result
+
+
+def get_side_chain_distances_and_angles(mol: Chem.Mol) -> Dict[str, Dict[str, pd.DataFrame]]:
+    side_chain_torsion_idxs = peptides.get_side_chain_torsion_idxs(mol)
+    side_chain_distances_and_angles = {}
+
+    for backbone_atom_idx, chain_atom_idxs in side_chain_torsion_idxs.items():
+        # Don't include backbone coordinates
+        distance_idxs = chain_atom_idxs[2:]
+        distances = get_linear_bond_distances(mol, distance_idxs)
+
+        angle_idxs = chain_atom_idxs[1:]
+        angles = get_linear_bond_angles(mol, angle_idxs)
+
+        dihedral_idxs = chain_atom_idxs
+        dihedrals = get_linear_dihedrals(mol, dihedral_idxs)
+
+        side_chain_distances_and_angles[backbone_atom_idx] = {
+            "distance": distances,
+            "angle": angles,
+            "dihedral": dihedrals,
+        }
+
+    return side_chain_distances_and_angles
 
 
 def get_macrocycle_bond_idxs(macrocycle_idxs: List[int]) -> List[Tuple[int, int]]:
@@ -75,6 +105,22 @@ def get_macrocycle_dihedral_idxs(
     return list(utils.get_overlapping_sublists(macrocycle_idxs, 4))
 
 
+def get_linear_bond_distances(mol: Chem.Mol, atom_idxs: List[int]) -> pd.DataFrame:
+    bond_idxs = list(utils.get_overlapping_sublists(atom_idxs, 2, wrap=False))
+    distances = []
+
+    for conformer in mol.GetConformers():
+        distances_conf = [
+            AllChem.GetBondLength(conformer, *bond_atom_idxs) for bond_atom_idxs in bond_idxs
+        ]
+        distances.append(distances_conf)
+
+    distance_df = pd.DataFrame(data=distances, columns=[tuple(idxs) for idxs in bond_idxs])
+    distance_df.index.name = "conf_idx"
+
+    return distance_df
+
+
 def get_macrocycle_bond_distances(mol: Chem.Mol, macrocycle_idxs: List[int]) -> pd.DataFrame:
     bond_idxs = get_macrocycle_bond_idxs(macrocycle_idxs)
     macrocycle_distances = defaultdict(list)
@@ -93,6 +139,22 @@ def get_macrocycle_bond_distances(mol: Chem.Mol, macrocycle_idxs: List[int]) -> 
     return distance_df
 
 
+def get_linear_bond_angles(mol: Chem.Mol, atom_idxs: List[int]) -> pd.DataFrame:
+    angle_idxs = list(utils.get_overlapping_sublists(atom_idxs, 3, wrap=False))
+    angles = []
+
+    for conformer in mol.GetConformers():
+        angles_conf = [
+            AllChem.GetAngleRad(conformer, *angle_atom_idxs) for angle_atom_idxs in angle_idxs
+        ]
+        angles.append(angles_conf)
+
+    angle_df = pd.DataFrame(data=angles, columns=[tuple(idxs) for idxs in angle_idxs])
+    angle_df.index.name = "conf_idx"
+
+    return angle_df
+
+
 def get_macrocycle_bond_angles(mol: Chem.Mol, macrocycle_idxs: List[int]) -> pd.DataFrame:
     angle_idxs = get_macrocycle_angle_idxs(macrocycle_idxs)
     macrocycle_angles = defaultdict(list)
@@ -107,6 +169,23 @@ def get_macrocycle_bond_angles(mol: Chem.Mol, macrocycle_idxs: List[int]) -> pd.
     angle_df.index.name = "conf_idx"
 
     return angle_df
+
+
+def get_linear_dihedrals(mol: Chem.Mol, atom_idxs: List[int]) -> pd.DataFrame:
+    dihedral_idxs = list(utils.get_overlapping_sublists(atom_idxs, 4, wrap=False))
+    dihedrals = []
+
+    for conformer in mol.GetConformers():
+        dihedrals_conf = [
+            AllChem.GetDihedralRad(conformer, *dihedral_atom_idxs)
+            for dihedral_atom_idxs in dihedral_idxs
+        ]
+        dihedrals.append(dihedrals_conf)
+
+    dihedral_df = pd.DataFrame(data=dihedrals, columns=[tuple(idxs) for idxs in dihedral_idxs])
+    dihedral_df.index.name = "conf_idx"
+
+    return dihedral_df
 
 
 def get_macrocycle_dihedrals(mol: Chem.Mol, macrocycle_idxs: List[int]) -> pd.DataFrame:
@@ -218,6 +297,33 @@ def modify_macrocycle_geometry(
     return new_mol
 
 
+def enumerate_macrocycle_geometries(
+    mol: Chem.Mol,
+    bond_dists: Union[np.ndarray, pd.Series],
+    bond_angles: Union[np.ndarray, pd.Series],
+    dihedrals: Union[np.ndarray, pd.Series],
+    macrocycle_idxs: Optional[List[int]] = None,
+) -> List[Chem.Mol]:
+    """Sequentially set distances, angles, and dihedrals of macrocycle starting at each atom."""
+    if macrocycle_idxs is None:
+        assert isinstance(bond_dists, pd.Series)
+        macrocycle_idxs = bond_dists.index.tolist()
+
+    mols = [
+        modify_macrocycle_geometry(
+            mol,
+            bond_dists,
+            bond_angles,
+            dihedrals,
+            macrocycle_idxs=macrocycle_idxs,
+            shift=shift,
+        )
+        for shift in range(len(macrocycle_idxs))
+    ]
+
+    return mols
+
+
 def set_macrocycle_geometry_with_best_dists(
     mol: Chem.Mol,
     bond_dists: Union[np.ndarray, pd.Series],
@@ -227,31 +333,241 @@ def set_macrocycle_geometry_with_best_dists(
 ) -> Chem.Mol:
     """Sequentially set distances, angles, and dihedrals of macrocycle starting at each atom and
     return the molecule that has the smallest distance error."""
-    min_dist_sse = float("inf")
-    mol_best_dists = None
-
     if macrocycle_idxs is None:
         assert isinstance(bond_dists, pd.Series)
         macrocycle_idxs = bond_dists.index.tolist()
 
-    for shift in range(len(macrocycle_idxs)):
-        mol_tmp = modify_macrocycle_geometry(
-            mol,
-            bond_dists,
-            bond_angles,
-            dihedrals,
-            macrocycle_idxs=macrocycle_idxs,
-            shift=shift,
-        )
+    mols = enumerate_macrocycle_geometries(
+        mol, bond_dists, bond_angles, dihedrals, macrocycle_idxs
+    )
 
-        actual_bond_dists = get_macrocycle_bond_distances(mol_tmp, macrocycle_idxs).loc[0]
-        distance_sse = np.sum((actual_bond_dists - bond_dists) ** 2)
+    def compute_distance_sse(_mol: Chem.Mol):
+        actual_bond_dists = get_macrocycle_bond_distances(_mol, macrocycle_idxs).loc[0]
+        return np.sum((actual_bond_dists - bond_dists) ** 2)
 
-        if distance_sse < min_dist_sse:
-            min_dist_sse = distance_sse
-            mol_best_dists = mol_tmp
+    mol_best_dists = min(mols, key=compute_distance_sse)
 
     return mol_best_dists
+
+
+def set_macrocycle_geometry_with_average_positions(
+    mol: Chem.Mol,
+    bond_dists: Union[np.ndarray, pd.Series],
+    bond_angles: Union[np.ndarray, pd.Series],
+    dihedrals: Union[np.ndarray, pd.Series],
+    macrocycle_idxs: Optional[List[int]] = None,
+) -> Chem.Mol:
+    """Sequentially set distances, angles, and dihedrals of macrocycle starting at each atom and
+    return the molecule that has the smallest distance error."""
+    if macrocycle_idxs is None:
+        assert isinstance(bond_dists, pd.Series)
+        macrocycle_idxs = bond_dists.index.tolist()
+
+    # Set macrocycle geometries starting from each atom
+    mols = enumerate_macrocycle_geometries(
+        mol, bond_dists, bond_angles, dihedrals, macrocycle_idxs
+    )
+    mol = chem.combine_mols(mols)
+
+    # Align geometries
+    AllChem.AlignMolConformers(mol, atomIds=macrocycle_idxs)
+
+    # Average positions
+    ring_pos_arrays = [conf.GetPositions()[macrocycle_idxs] for conf in mol.GetConformers()]
+    ring_pos_avg = np.mean(ring_pos_arrays, axis=0)
+    mol = chem.set_atom_positions(mol, ring_pos_avg, atom_idxs=macrocycle_idxs)
+
+    return mol
+
+
+class DistanceBatched:
+    def __init__(self, index: Union[np.ndarray, List[Tuple[int, int]]]) -> None:
+        self.index = np.asarray(index)
+        if self.index.shape[1] != 2:
+            raise ValueError("Index array must have shape (N, 2)")
+
+    def value(self, xyz: np.ndarray) -> np.ndarray:
+        if self.index.size == 0:
+            return np.array([])
+
+        xyz = xyz.reshape(-1, 3)
+
+        doubles = xyz[self.index, :]
+        return np.linalg.norm(doubles[:, 0, :] - doubles[:, 1, :], axis=-1)
+
+    def derivative(self, xyz: np.ndarray) -> np.ndarray:
+        """Compute the derivatives."""
+        if self.index.size == 0:
+            return np.array([[]])
+
+        xyz = xyz.reshape(-1, 3)
+
+        doubles = xyz[self.index, :]
+        diff = doubles[:, 0, :] - doubles[:, 1, :]
+        norm = np.linalg.norm(diff, axis=-1, keepdims=True)
+        u = (diff) / norm
+
+        M, _ = xyz.shape  # Shapes: K sets, M points, 3 dimensions
+        B, _ = self.index.shape  # B batches
+
+        # Initialize the derivatives array for output
+        derivatives = np.zeros((B, M, 3), dtype=np.float64)
+
+        # Indices for adding/subtracting u vectors
+        i_b = np.ogrid[:B]
+
+        # Update for the first index in each pair
+        derivatives[i_b, self.index[:, 0], :] += u
+        # Update for the second index in each pair
+        derivatives[i_b, self.index[:, 1], :] -= u
+
+        # Reshape for the expected output shape
+        derivatives = derivatives.reshape(B, -1)  # Reshape to (K, B, M*3)
+
+        return derivatives
+
+
+class AngleBatched:
+    def __init__(self, index: Union[np.ndarray, List[Tuple[int, int, int]]]) -> None:
+        self.index = np.asarray(index)
+        if self.index.shape[1] != 3:
+            raise ValueError("Index array must have shape (N, 3)")
+
+    def value(self, xyz: np.ndarray) -> np.ndarray:
+        if self.index.size == 0:
+            return np.array([])
+
+        xyz = xyz.reshape(-1, 3)
+
+        triples = xyz[self.index, :]
+
+        a1 = triples[:, 0, :] - triples[:, 1, :]
+        a2 = triples[:, 2, :] - triples[:, 1, :]
+
+        norm1 = a1 / np.linalg.norm(a1, axis=-1, keepdims=True)
+        norm2 = a2 / np.linalg.norm(a2, axis=-1, keepdims=True)
+
+        return np.arccos((norm1 * norm2).sum(axis=-1))
+
+    def derivative(self, xyz: np.ndarray) -> np.ndarray:
+        if self.index.size == 0:
+            return np.array([[]])
+
+        xyz = xyz.reshape(-1, 3)
+
+        triples = xyz[self.index, :]
+
+        u_prime = triples[:, 0, :] - triples[:, 1, :]
+        v_prime = triples[:, 2, :] - triples[:, 1, :]
+
+        u_norm = np.linalg.norm(u_prime, axis=-1, keepdims=True)
+        v_norm = np.linalg.norm(v_prime, axis=-1, keepdims=True)
+
+        u = u_prime / u_norm
+        v = v_prime / v_norm
+
+        w_prime = np.cross(u, v)
+        w_norm = np.linalg.norm(w_prime, axis=-1, keepdims=True)
+        w = w_prime / w_norm
+
+        term1 = np.cross(u, w) / u_norm
+        term2 = np.cross(w, v) / v_norm
+
+        M, _ = xyz.shape  # Shapes: K sets, M points, 3 dimensions
+        B, _ = self.index.shape  # B batches
+
+        # Initialize derivatives array
+        derivatives = np.zeros((B, M, 3), dtype=np.float64)
+
+        # Indices for adding/subtracting u vectors
+        i_b = np.ogrid[:B]
+
+        # Update for the first index in each pair
+        derivatives[i_b, self.index[:, 0], :] += term1
+        # Update for the second index in each pai
+        derivatives[i_b, self.index[:, 1], :] -= term1 + term2
+        derivatives[i_b, self.index[:, 2], :] += term2
+
+        # Reshape to the expected output shape
+        derivatives = derivatives.reshape(B, -1)  # Shape: (K, B, M*3)
+        return derivatives
+
+
+class DihedralBatched:
+    def __init__(self, index: Union[np.ndarray, List[Tuple[int, int, int, int]]]) -> None:
+        self.index = np.asarray(index)
+        if self.index.shape[1] != 4:
+            raise ValueError("Index array must have shape (N, 4)")
+
+    def value(self, xyz: np.ndarray) -> np.ndarray:
+        if self.index.size == 0:
+            return np.array([])
+
+        xyz = xyz.reshape(-1, 3)
+
+        quadruples = xyz[self.index, :]
+        a1 = quadruples[:, 1, :] - quadruples[:, 0, :]
+        a2 = quadruples[:, 2, :] - quadruples[:, 1, :]
+        a3 = quadruples[:, 3, :] - quadruples[:, 2, :]
+
+        cross1 = np.cross(a2, a3)
+        cross2 = np.cross(a1, a2)
+
+        arg1 = np.sum(np.multiply(a1, cross1), axis=-1) * np.sqrt((a2**2).sum(axis=-1))
+        arg2 = np.sum(np.multiply(cross1, cross2), axis=-1)
+
+        rad = np.arctan2(arg1, arg2)
+        return rad
+
+    def derivative(self, xyz: np.ndarray) -> np.ndarray:
+        if self.index.size == 0:
+            return np.array([[]])
+
+        xyz = xyz.reshape(-1, 3)
+
+        quadruples = xyz[self.index, :]
+
+        u_prime = quadruples[:, 0, :] - quadruples[:, 1, :]
+        w_prime = quadruples[:, 2, :] - quadruples[:, 1, :]
+        v_prime = quadruples[:, 3, :] - quadruples[:, 2, :]
+
+        u_norm = np.linalg.norm(u_prime, axis=-1, keepdims=True)
+        w_norm = np.linalg.norm(w_prime, axis=-1, keepdims=True)
+        v_norm = np.linalg.norm(v_prime, axis=-1, keepdims=True)
+        u = u_prime / u_norm
+        w = w_prime / w_norm
+        v = v_prime / v_norm
+
+        dot_uw = np.expand_dims((u * w).sum(axis=-1), axis=-1)
+        dot_vw = np.expand_dims((v * w).sum(axis=-1), axis=-1)
+
+        cross_uw = np.cross(u, w)
+        cross_vw = np.cross(v, w)
+
+        term1 = cross_uw / (u_norm * (1 - dot_uw**2))
+        term3 = cross_uw * dot_uw / (w_norm * (1 - dot_uw**2))
+        term2 = cross_vw / (v_norm * (1 - dot_vw**2))
+        term4 = cross_vw * dot_vw / (w_norm * (1 - dot_vw**2))
+
+        M, _ = xyz.shape  # Shapes: K sets, M points, 3 dimensions
+        B, _ = self.index.shape  # B batches
+
+        # Initialize derivatives array
+        derivatives = np.zeros((B, M, 3), dtype=np.float64)
+
+        # Indices for adding/subtracting u vectors
+        i_b = np.ogrid[:B]
+
+        # Update for the first index in each pair
+        derivatives[i_b, self.index[:, 0], :] += term1
+        derivatives[i_b, self.index[:, 1], :] += -term1 + term3 - term4
+        derivatives[i_b, self.index[:, 2], :] += term2 - term3 + term4
+        derivatives[i_b, self.index[:, 3], :] -= term2
+
+        # Reshape to the expected output shape
+        derivatives = derivatives.reshape(B, -1)  # Shape: (K, B, M*3)
+
+        return derivatives
 
 
 class InternalCoordinates:
@@ -268,27 +584,27 @@ class InternalCoordinates:
         if dihedral_idxs is None:
             dihedral_idxs = []
 
-        self.distances = [Distance(*idxs) for idxs in bond_idxs]
-        self.angles = [Angle(*idxs) for idxs in angle_idxs]
-        self.dihedrals = [Dihedral(*idxs) for idxs in dihedral_idxs]
+        self.distances = DistanceBatched(bond_idxs)
+        self.angles = AngleBatched(angle_idxs)
+        self.dihedrals = DihedralBatched(dihedral_idxs)
 
     def compute_distances(self, xyz: np.ndarray) -> np.ndarray:
-        return np.array([distance.value(xyz) for distance in self.distances])
+        return self.distances.value(xyz)
 
     def compute_angles(self, xyz: np.ndarray) -> np.ndarray:
-        return np.array([angle.value(xyz) for angle in self.angles])
+        return self.angles.value(xyz)
 
     def compute_dihedrals(self, xyz: np.ndarray) -> np.ndarray:
-        return np.array([dihedral.value(xyz) for dihedral in self.dihedrals])
+        return self.dihedrals.value(xyz)
 
     def compute_distance_jacobian(self, xyz: np.ndarray) -> np.ndarray:
-        return np.array([distance.derivative(xyz).ravel() for distance in self.distances])
+        return self.distances.derivative(xyz)
 
     def compute_angle_jacobian(self, xyz: np.ndarray) -> np.ndarray:
-        return np.array([angle.derivative(xyz).ravel() for angle in self.angles])
+        return self.angles.derivative(xyz)
 
     def compute_dihedral_jacobian(self, xyz: np.ndarray) -> np.ndarray:
-        return np.array([dihedral.derivative(xyz).ravel() for dihedral in self.dihedrals])
+        return self.dihedrals.derivative(xyz)
 
 
 class RingInternalCoordinates(InternalCoordinates):
@@ -318,6 +634,7 @@ class RingInternalCoordinates(InternalCoordinates):
         angles_as_constraints: bool = False,
         angle_vals_max_devs: Optional[Union[np.ndarray, pd.Series]] = None,
         use_orientation_constraints: bool = False,
+        opt_init: Literal["best_dists", "average"] = "best_dists",
         skip_opt: bool = False,  # Just return the results from setting coords in sequence
         print_warning: bool = True,
         return_result_obj: bool = False,
@@ -335,15 +652,29 @@ class RingInternalCoordinates(InternalCoordinates):
             if isinstance(angle_vals_max_devs, pd.Series):
                 angle_vals_max_devs = angle_vals_max_devs.loc[self.ring_idxs]
 
-        # Get initial guess using sequential approach to setting angles/dihedrals, and
-        # select the molecule with the distances that most closely match the true ones
-        mol0 = set_macrocycle_geometry_with_best_dists(
-            mol,
-            distance_vals,
-            angle_vals_target,
-            dihedral_vals_target,
-            macrocycle_idxs=self.ring_idxs,
-        )
+        if opt_init == "best_dists":
+            # Get initial guess using sequential approach to setting angles/dihedrals,
+            # and select the molecule with the distances that most closely match the
+            # true ones
+            mol0 = set_macrocycle_geometry_with_best_dists(
+                mol,
+                distance_vals,
+                angle_vals_target,
+                dihedral_vals_target,
+                macrocycle_idxs=self.ring_idxs,
+            )
+        elif opt_init == "average":
+            # Get initial guess using sequential approach to setting angles/dihedrals,
+            # and average the coordinates from each molecule (for the ring atoms)
+            mol0 = set_macrocycle_geometry_with_average_positions(
+                mol,
+                distance_vals,
+                angle_vals_target,
+                dihedral_vals_target,
+                macrocycle_idxs=self.ring_idxs,
+            )
+        else:
+            raise ValueError(f"Invalid value for opt_init: {opt_init}")
 
         xyz0 = mol0.GetConformer().GetPositions()[self.ring_idxs]
 

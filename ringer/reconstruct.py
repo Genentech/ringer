@@ -5,7 +5,7 @@ import logging
 import multiprocessing
 import pickle
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import pandas as pd
 import ray
@@ -38,20 +38,33 @@ def reconstruct_ring(
     bond_dist_dict: Dict[str, float],
     bond_angle_dict: Optional[Dict[str, float]] = None,
     bond_angle_dev_dict: Optional[Dict[str, float]] = None,
+    opt_init: Literal["best_dists", "average"] = "best_dists",
     skip_opt: bool = False,
+    max_conf: Optional[int] = None,
     return_unsuccessful: bool = False,
+    mol_opt_dir: Optional[Union[str, Path]] = None,
 ) -> Tuple[str, Tuple[Chem.Mol, List[pd.DataFrame]]]:
     mol = data["mol"]
     structure = data["structure"]
-    return fname, reconstruction.reconstruct_ring(
+
+    result = reconstruction.reconstruct_ring(
         mol=mol,
         structure=structure,
         bond_dist_dict=bond_dist_dict,
         bond_angle_dict=bond_angle_dict,
         bond_angle_dev_dict=bond_angle_dev_dict,
+        opt_init=opt_init,
         skip_opt=skip_opt,
+        max_conf=max_conf,
         return_unsuccessful=return_unsuccessful,
     )
+
+    if mol_opt_dir is not None:
+        mol_opt = result[0]
+        mol_opt_path = Path(mol_opt_dir) / Path(fname).name
+        save_pickle(mol_opt_path, mol_opt)
+
+    return fname, result
 
 
 def get_as_iterator(obj_ids):
@@ -70,7 +83,9 @@ def reconstruct(
     mean_distances_path: str,
     mean_angles_path: Optional[str] = None,
     std_angles_path: Optional[str] = None,
+    opt_init: str = "best_dists",
     skip_opt: bool = False,
+    max_conf: Optional[int] = None,
     save_unsuccessful: bool = False,
     ncpu: int = multiprocessing.cpu_count(),
 ) -> None:
@@ -90,6 +105,9 @@ def reconstruct(
         for fname, structure in structures_dict.items()
     }
 
+    mol_opt_dir = output_dir / "reconstructed_mols"
+    mol_opt_dir.mkdir(exist_ok=True)
+
     # Reconstruct
     if skip_opt:
         logging.info("Skipping opt")
@@ -101,17 +119,17 @@ def reconstruct(
             mean_bond_distances,
             bond_angle_dict=mean_bond_angles,
             bond_angle_dev_dict=std_bond_angles,
+            opt_init=opt_init,
             skip_opt=skip_opt,
+            max_conf=max_conf,
             return_unsuccessful=save_unsuccessful,
+            mol_opt_dir=mol_opt_dir,
         )
         for fname, mol_and_structure in mols_and_structures.items()
     ]
     mols_and_coords_opt = dict(tqdm(get_as_iterator(result_ids), total=len(result_ids)))
 
     # Post-process and dump data
-    mol_opt_dir = output_dir / "reconstructed_mols"
-    mol_opt_dir.mkdir(exist_ok=True)
-
     def get_structure_from_coords(coords: List[pd.DataFrame], name: str) -> Dict[str, Any]:
         # Convert list of coords to structure
         # Concatenate making hierarchical index of sample_idx and atom_idx
@@ -129,9 +147,7 @@ def reconstruct(
     reconstructed_structures_dict = {}
     unsuccessful_results = {}
     for fname, result in mols_and_coords_opt.items():
-        mol_opt, coords_opt = result[:2]
-        mol_opt_path = mol_opt_dir / Path(fname).name
-        save_pickle(mol_opt_path, mol_opt)
+        coords_opt = result[1]
 
         structure = get_structure_from_coords(coords_opt, fname)
         reconstructed_structures_dict[fname] = structure

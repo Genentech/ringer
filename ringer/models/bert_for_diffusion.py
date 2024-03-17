@@ -145,6 +145,10 @@ class BertForDiffusionBase(modeling_bert.BertPreTrainedModel):
             train_args = json.load(source)
         config = configuration_bert.BertConfig.from_json_file(dir_name / "config.json")
 
+        ft_names = data.DATASET_CLASSES[
+            train_args["internal_coordinates_definitions"]
+        ].feature_names
+        logging.info(f"Feature names: {ft_names}")
         if ft_is_angular is None:
             ft_is_angular = data.DATASET_CLASSES[
                 train_args["internal_coordinates_definitions"]
@@ -154,6 +158,7 @@ class BertForDiffusionBase(modeling_bert.BertPreTrainedModel):
         model_args = dict(
             config=config,
             ft_is_angular=ft_is_angular,
+            ft_names=ft_names,
             time_encoding=train_args["time_encoding"],
             decoder=train_args["decoder"],
             **kwargs,
@@ -203,6 +208,7 @@ class BertForDiffusionBase(modeling_bert.BertPreTrainedModel):
                 retval = cls(**model_args)
                 loaded = torch.load(ckpt_name, map_location=torch.device("cpu"))
                 retval.load_state_dict(loaded["state_dict"])
+            retval.train_epoch_counter = epoch_getter(ckpt_name)
         else:
             retval = cls(**model_args)
             logging.info(f"Loaded uninitialized model from {dir_name}")
@@ -314,6 +320,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         self,
         lr: float = 5e-5,
         loss: Union[Callable, LOSS_KEYS] = "smooth_l1",
+        use_feat_mask: bool = True,  # if available
         l2: float = 0.0,
         l1: float = 0.0,
         circle_reg: float = 0.0,
@@ -347,6 +354,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
             assert (
                 len(self.loss_func) == self.n_inputs
             ), f"Got {len(self.loss_func)} loss functions, expected {self.n_inputs}"
+        self.use_feat_mask = use_feat_mask
 
         self.l1_lambda = l1
         self.l2_lambda = l2
@@ -390,6 +398,10 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         assert len(unmask_idx) == 2
         loss_terms = []
         for i in range(known_noise.shape[-1]):
+            # feat_mask masks feature dimension and sequence dimension,
+            # so it can replace attention mask
+            if self.use_feat_mask and "feat_mask" in batch:
+                unmask_idx = torch.where(batch["feat_mask"][..., i])
             loss_fn = self.loss_func[i] if isinstance(self.loss_func, list) else self.loss_func
             logging.debug(f"Using loss function {loss_fn}")
             # Determine whether the loss accepts circle_penalty
@@ -425,7 +437,15 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         """Training step, runs once per batch."""
         loss_terms = self._get_loss_terms(batch)
-        avg_loss = torch.mean(loss_terms)
+
+        if "weights" in batch:
+            weights = batch["weights"][0]  # Same for each item in batch
+            nan_mask = ~loss_terms.isnan()
+            loss_terms_masked = loss_terms[nan_mask]
+            weights_masked = weights[nan_mask]
+            avg_loss = torch.dot(weights_masked, loss_terms_masked) / torch.sum(weights_masked)
+        else:
+            avg_loss = torch.nanmean(loss_terms)
 
         # L1 loss implementation
         if self.l1_lambda > 0:
@@ -444,7 +464,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
     def training_epoch_end(self, outputs: Sequence[Dict[str, torch.Tensor]]) -> None:
         """Log the average training loss over the epoch."""
         losses = torch.stack([o["loss"] for o in outputs])
-        mean_loss = torch.mean(losses)
+        mean_loss = torch.nanmean(losses)
         t_delta = time.time() - self.train_epoch_last_time
         pl.utilities.rank_zero_info(
             f"Train loss at epoch {self.train_epoch_counter} end: {mean_loss:.4f} ({t_delta:.2f} seconds)"
@@ -465,7 +485,15 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
                 else self.write_preds_to_dir / f"{self.write_preds_counter}_preds.json",
             )
             self.write_preds_counter += 1
-        avg_loss = torch.mean(loss_terms)
+
+        if "weights" in batch:
+            weights = batch["weights"][0]  # Same for each item in batch
+            nan_mask = ~loss_terms.isnan()
+            loss_terms_masked = loss_terms[nan_mask]
+            weights_masked = weights[nan_mask]
+            avg_loss = torch.dot(weights_masked, loss_terms_masked) / torch.sum(weights_masked)
+        else:
+            avg_loss = torch.nanmean(loss_terms)
 
         # Log each of the loss terms
         assert len(loss_terms) == len(self.ft_names)
@@ -483,7 +511,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         """Log the average validation loss over the epoch."""
         # Note that this method is called before zstraining_epoch_end().
         losses = torch.stack([o["val_loss"] for o in outputs])
-        mean_loss = torch.mean(losses)
+        mean_loss = torch.nanmean(losses)
         pl.utilities.rank_zero_info(
             f"Valid loss at epoch {self.train_epoch_counter} end: {mean_loss:.4f}"
         )

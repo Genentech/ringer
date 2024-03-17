@@ -26,6 +26,7 @@ def compute_metrics(
     mol_dir: str,
     mol_opt_dir: str,
     out_dir: str,
+    include_all_atom: bool = True,
     ncpu: int = multiprocessing.cpu_count(),
 ) -> None:
     output_dir = Path(out_dir)
@@ -48,7 +49,10 @@ def compute_metrics(
             mols_opt[name] = mol_opt
 
     # Evaluate
-    cov_mat_evaluator = evaluation.CovMatEvaluator()
+    metric_names = ["ring-rmsd", "ring-tfd"]
+    if include_all_atom:
+        metric_names.append("rmsd")
+    cov_mat_evaluator = evaluation.CovMatEvaluator(metric_names)
     metrics = process_map(cov_mat_evaluator, mols_opt.values(), mols.values(), max_workers=ncpu)
     metrics = dict(zip(mols.keys(), metrics))  # Add names as keys
 
