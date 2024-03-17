@@ -16,7 +16,7 @@ pip install -e .
 
 ## Data
 
-Download and extract the CREMP pickle.tar.gz from [here](https://doi.org/10.5281/zenodo.8010582). Use [train.csv](data/cremp/train.csv) and [test.csv](data/cremp/test.csv) to partition it into training and test data and put the corresponding files into [train](data/cremp/train) and [test](data/cremp/test).
+Download and extract the CREMP pickle.tar.gz from [here](https://doi.org/10.5281/zenodo.7931444). Use [train.csv](data/cremp/train.csv) and [test.csv](data/cremp/test.csv) to partition it into training and test data and put the corresponding files into [train](data/cremp/train) and [test](data/cremp/test).
 
 ## Training
 
@@ -38,7 +38,7 @@ train conditional.json --wandb-run <run_name>
 
 The [pre-trained model](assets/models/conditional) is included in this repository.
 
-To generate samples and evaluate the pre-trained model on all the test data, run:
+To generate samples (not including side-chain reconstruction) and evaluate the pre-trained model on all the test data, run:
 
 ```eval
 evaluate \
@@ -48,6 +48,12 @@ evaluate \
 ```
 
 Run `evaluate --help` to see all options available for sampling and evaluation.
+
+Computing metrics using `evaluate` can take a very long time because it is not parallelized. It is generally recommended to use [scripts/compute_metrics_single.py](scripts/compute_metrics_single.py) instead and run a separate job for each test molecule. The metrics for all molecules can subsequently be aggregated using [scripts/aggregate_metrics.py](scripts/aggregate_metrics.py). Run `python scripts/compute_metrics_single.py --help` for guidance on how to use the script.
+
+## Reconstruction
+
+Using `evaluate` does not reconstruct the side chains, which is done most effectively using [scripts/reconstruct_single.py](scripts/reconstruct_single.py). Moreover, the same parallelization inefficiency as described above when computing metrics applies to Cartesian coordinate reconstruction as well. Run `python scripts/reconstruct_single.py --help` for guidance on how to use the script. The script will run the optimization to reconstruct the ring coordinates, followed by a linear (NeRF) reconstruction of the side chains using the conformer samples generated using RINGER.
 
 ## Contributing
 
@@ -117,8 +123,8 @@ You can also cite the CREMP Zenodo repository directly:
   month        = may,
   year         = 2023,
   publisher    = {Zenodo},
-  version      = {1.0.0},
-  doi          = {10.5281/zenodo.7931445},
-  url          = {https://doi.org/10.5281/zenodo.7931445}
+  version      = {1.0.1},
+  doi          = {10.5281/zenodo.7931444},
+  url          = {https://doi.org/10.5281/zenodo.7931444}
 }
 ```
