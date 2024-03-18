@@ -11,9 +11,12 @@ from rdkit import Chem
 from ringer.utils import evaluation
 
 
-def load_pickle(path: Union[str, Path]) -> Any:
+def load_mol(path: Union[str, Path]) -> Chem.Mol:
     with open(path, "rb") as f:
-        return pickle.load(f)
+        mol = pickle.load(f)
+    if isinstance(mol, dict):
+        mol = mol["rd_mol"]
+    return mol
 
 
 def save_pickle(path: Union[str, Path], data: Any) -> None:
@@ -49,8 +52,8 @@ def compute_metrics(
         raise IOError(f"'{mol_opt_path}' is missing")
 
     # Load data
-    mol = load_pickle(mol_path)
-    mol_opt = load_pickle(mol_opt_path)
+    mol = load_mol(mol_path)
+    mol_opt = load_mol(mol_opt_path)
 
     if max_true_confs is not None:
         mol = remove_confs(mol, max_true_confs)

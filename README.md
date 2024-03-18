@@ -34,26 +34,53 @@ To log a training run with Weights & Biases, set up your configuration in [confi
 train conditional.json --wandb-run <run_name>
 ```
 
-## Evaluation
+## Sampling
 
 The [pre-trained model](assets/models/conditional) is included in this repository.
 
-To generate samples (not including side-chain reconstruction) and evaluate the pre-trained model on all the test data, run:
+To generate samples for the CREMP test set, run:
 
 ```eval
 evaluate \
-    --model-dir <path_to_ringer>/assets/models/conditional \
+    --model-dir assets/models/conditional \
     --data-dir cremp/test \
-    --split-sizes 0.0 0.0 1.0
+    --split-sizes 0.0 0.0 1.0 \
+    --sample-only
 ```
+
+This creates a `sample` directory containing samples for all molecules in `sample/samples.pickle`.
 
 Run `evaluate --help` to see all options available for sampling and evaluation.
 
-Computing metrics using `evaluate` can take a very long time because it is not parallelized. It is generally recommended to use [scripts/compute_metrics_single.py](scripts/compute_metrics_single.py) instead and run a separate job for each test molecule. The metrics for all molecules can subsequently be aggregated using [scripts/aggregate_metrics.py](scripts/aggregate_metrics.py). Run `python scripts/compute_metrics_single.py --help` for guidance on how to use the script.
-
 ## Reconstruction
 
-Using `evaluate` does not reconstruct the side chains, which is done most effectively using [scripts/reconstruct_single.py](scripts/reconstruct_single.py). Moreover, the same parallelization inefficiency as described above when computing metrics applies to Cartesian coordinate reconstruction as well. Run `python scripts/reconstruct_single.py --help` for guidance on how to use the script. The script will run the optimization to reconstruct the ring coordinates, followed by a linear (NeRF) reconstruction of the side chains using the conformer samples generated using RINGER.
+The `evaluate` command can also be used to reconstruct backbones (not including side chains) and to compute evaluation metrics. However, it is not recommended to do so because `evaluate` does not parallelize well across molecules.
+
+Instead, reconstruction (including side chains) is done most effectively for each molecule individually using [scripts/reconstruct_single.py](scripts/reconstruct_single.py). Parallelization can then be efficiently achieved by submitting a batch job array using an HPC job scheduler (e.g., Slurm) and passing the job array index as the first argument to the script. To reconstruct molecule 0, run:
+
+```shell
+python scripts/reconstruct_single.py 0 \
+    cremp/test \
+    sample/samples.pickle \
+    sample/reconstructed_mols \
+    assets/models/conditional/training_mean_distances.json
+```
+
+The script will run the optimization to reconstruct the ring coordinates, followed by a linear (NeRF) reconstruction of the side chains using the [conformer samples previously generated](#sampling), and save the resulting molecule in `sample/reconstructed_mols`. Note that even though we point the script to `cremp/test`, it only uses the atom identities and connectivity information from the test molecules; their geometries are entirely set during the reconstruction procedure.
+
+Run `python scripts/reconstruct_single.py --help` for an overview of other parameters available for reconstruction.
+
+## Evaluation
+
+As with reconstruction, computing metrics is best done separately for each molecule using [scripts/compute_metrics_single.py](scripts/compute_metrics_single.py) followed by aggregation across molecules using [scripts/aggregate_metrics.py](scripts/aggregate_metrics.py). For example, to compute metrics for the `H.A.S.V` macrocycle, run
+
+```shell
+python scripts/compute_metrics_single.py \
+    cremp/test/H.A.S.V.pickle \
+    sample/reconstructed_mols/H.A.S.V.pickle
+```
+
+Run `python scripts/compute_metrics_single.py --help` and `python scripts/aggregate_metrics.py --help` for an overview of other parameters available for computing metrics.
 
 ## Contributing
 

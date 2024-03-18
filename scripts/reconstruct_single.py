@@ -77,7 +77,7 @@ def reconstruct(
     mean_angles_path: Optional[str] = None,
     std_angles_path: Optional[str] = None,
     angles_as_constraints: bool = False,
-    opt_init: str = "best_dists",
+    opt_init: str = "average",
     skip_opt: bool = False,
     max_conf: Optional[int] = None,
     ncpu: int = 1,
@@ -96,6 +96,8 @@ def reconstruct(
     mol_name = Path(fname).name
     mol_path = Path(mol_dir) / mol_name
     mol = load_pickle(mol_path)
+    if isinstance(mol, dict):
+        mol = mol["rd_mol"]
     structure = structures_dict[fname]
 
     # Reconstruct
